@@ -94,10 +94,6 @@ impl LoopDetector {
     pub fn note_command(&mut self, command: &str) {
         self.last_command_fp = hash64(command.as_bytes());
     }
-
-    pub fn failure_markers(&self) -> &[String] {
-        &self.failure_markers
-    }
 }
 
 pub fn hash64(bytes: &[u8]) -> u64 {

@@ -129,6 +129,16 @@ const SCRIPT_INTERPRETERS: &[&str] = &[
 ];
 const WRAPPERS: &[&str] = &["env", "busybox"];
 
+/// True for shells, script runtimes, and wrappers. Shared with policy so
+/// `node` and `nodejs` stay exempt from a nonempty command allowlist.
+pub fn is_interpreter_name(base: &str) -> bool {
+    let b = base.rsplit('/').next().unwrap_or(base);
+    SHELL_INTERPRETERS.contains(&b)
+        || SCRIPT_INTERPRETERS.contains(&b)
+        || WRAPPERS.contains(&b)
+        || b == "eval"
+}
+
 const MAX_REPARSE_DEPTH: usize = 8;
 
 /// Parse `source` as bash and walk it fail-closed.

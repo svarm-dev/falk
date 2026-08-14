@@ -61,7 +61,6 @@ impl FinopsEngine {
             }
             outcome.events.push(priced);
         }
-        note_commands_from_chunk(&mut self.loops, chunk);
         if let Some(trip) = self.loops.observe_chunk(chunk) {
             outcome.decisions.push(LimitDecision::Loop {
                 reason: trip.reason,
@@ -69,24 +68,6 @@ impl FinopsEngine {
             });
         }
         outcome
-    }
-}
-
-fn note_commands_from_chunk(loops: &mut LoopDetector, chunk: &str) {
-    for line in chunk.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('{') || trimmed.starts_with('[') {
-            continue;
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if loops
-            .failure_markers()
-            .iter()
-            .any(|m| lower.contains(&m.to_ascii_lowercase()))
-        {
-            continue;
-        }
-        loops.note_command(trimmed);
     }
 }
 
@@ -244,6 +225,25 @@ mod tests {
         assert!(
             tripped.is_some(),
             "repeated failed command fingerprint must still trip"
+        );
+    }
+
+    #[test]
+    fn ingest_prose_then_repeated_errors_does_not_loop_kill() {
+        let cfg = FinopsConfig::default();
+        let mut engine = FinopsEngine::from_config(&cfg);
+        let _ = engine.ingest_chunk("I'll retry that approach now.\n", &cfg);
+        let mut last = None;
+        for _ in 0..cfg.loop_detect.repeat_threshold {
+            let outcome = engine.ingest_chunk("Error: retry\n", &cfg);
+            last = outcome
+                .decisions
+                .into_iter()
+                .find(|d| matches!(d, LimitDecision::Loop { .. }));
+        }
+        assert!(
+            last.is_none(),
+            "agent prose must not become a command fingerprint: {last:?}"
         );
     }
 }

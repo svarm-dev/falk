@@ -42,7 +42,7 @@ fn check_command(name: &str, args: &[String], cfg: &SecurityConfig) -> Option<St
         return check_command(&inner, &rest, cfg);
     }
 
-    if is_interpreter(&base_lc) {
+    if crate::ast::is_interpreter_name(&base_lc) {
         // Interpreters themselves are not blanket-blocked.
     } else if !cfg.allowlist.commands.is_empty() {
         let allowed = cfg
@@ -75,26 +75,6 @@ fn check_command(name: &str, args: &[String], cfg: &SecurityConfig) -> Option<St
         }
     }
     None
-}
-
-fn is_interpreter(base: &str) -> bool {
-    matches!(
-        base,
-        "bash"
-            | "sh"
-            | "dash"
-            | "zsh"
-            | "ksh"
-            | "ash"
-            | "busybox"
-            | "env"
-            | "python"
-            | "python3"
-            | "node"
-            | "ruby"
-            | "perl"
-            | "lua"
-    )
 }
 
 fn sensitive_path_hit(arg: &str, paths: &[String]) -> Option<String> {
@@ -281,6 +261,25 @@ mod tests {
         assert!(
             evaluate_script("python3 --version", &cfg).is_none(),
             "interpreter name itself is not blocked"
+        );
+    }
+
+    #[test]
+    fn nodejs_is_allowlist_exempt_like_node() {
+        let mut cfg = SecurityConfig::default();
+        cfg.allowlist.commands = vec!["echo".into()];
+        assert!(
+            evaluate_script("nodejs --version", &cfg).is_none(),
+            "nodejs must not be an allowlist reject"
+        );
+        assert!(
+            evaluate_script("node --version", &cfg).is_none(),
+            "node must stay exempt"
+        );
+        assert!(
+            evaluate_script("rm -rf /tmp/x", &cfg)
+                .unwrap()
+                .contains("allowlist")
         );
     }
 }

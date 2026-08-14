@@ -168,10 +168,11 @@ impl StreamingRedactor {
     }
 }
 
-/// Max bytes held after an unmatched `-----BEGIN ` (covers a 4096-bit PEM).
+/// Max bytes held after an unmatched private-key BEGIN (covers a 4096-bit PEM).
 const PEM_HOLD_CAP: usize = 16 * 1024;
 const PEM_BEGIN: &[u8] = b"-----BEGIN ";
 const PEM_END: &[u8] = b"-----END ";
+const PRIVATE_KEY: &[u8] = b"PRIVATE KEY";
 
 /// How many leading pending bytes are safe to emit. Shipped so tests drive
 /// the same hold-back rule as `StreamingRedactor::push`.
@@ -179,19 +180,48 @@ pub fn safe_emit_len(pending: &[u8], holdback: usize) -> usize {
     let holdback = holdback.max(32);
     let normal = pending.len().saturating_sub(holdback);
     match open_pem_start(pending) {
-        Some(start) if pending.len() - start > PEM_HOLD_CAP => start,
+        Some(start) if pending.len() - start > PEM_HOLD_CAP => {
+            pending.len() - PEM_HOLD_CAP
+        }
         Some(start) => start.min(normal),
         None => normal,
     }
 }
 
+/// Offset of the last unmatched `BEGIN … PRIVATE KEY` header, if any.
 fn open_pem_start(buf: &[u8]) -> Option<usize> {
-    let begin = find_bytes(buf, PEM_BEGIN)?;
-    if find_bytes(&buf[begin..], PEM_END).is_some() {
-        None
-    } else {
-        Some(begin)
+    let mut last_open = None;
+    let mut search = 0;
+    while let Some(rel) = find_bytes(&buf[search..], PEM_BEGIN) {
+        let start = search + rel;
+        let header = header_line(buf, start);
+        search = start + PEM_BEGIN.len();
+        if find_bytes(header, PRIVATE_KEY).is_none() {
+            continue;
+        }
+        if !has_end_private_key(&buf[start..]) {
+            last_open = Some(start);
+        }
     }
+    last_open
+}
+
+fn header_line(buf: &[u8], start: usize) -> &[u8] {
+    let rest = &buf[start..];
+    let end = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+    &rest[..end]
+}
+
+fn has_end_private_key(buf: &[u8]) -> bool {
+    let mut search = 0;
+    while let Some(rel) = find_bytes(&buf[search..], PEM_END) {
+        let at = search + rel;
+        if find_bytes(header_line(buf, at), PRIVATE_KEY).is_some() {
+            return true;
+        }
+        search = at + PEM_END.len();
+    }
+    false
 }
 
 fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -279,6 +309,54 @@ mod tests {
         assert!(
             text.contains("[redacted pem]"),
             "must use Svarm.Redact PEM replacement: {text:?}"
+        );
+    }
+
+    #[test]
+    fn open_pem_past_cap_emits_oldest_bytes() {
+        let mut body = b"-----BEGIN RSA PRIVATE KEY-----\n".to_vec();
+        body.extend(std::iter::repeat_n(b'A', PEM_HOLD_CAP + 200));
+        let emit = safe_emit_len(&body, 512);
+        assert!(
+            emit > 0,
+            "cap must release bytes so pending does not grow forever"
+        );
+        assert_eq!(emit, body.len() - PEM_HOLD_CAP);
+
+        let mut r = StreamingRedactor::svarm(512);
+        let visible = r.push(&body);
+        assert!(
+            !visible.is_empty(),
+            "StreamingRedactor::push must emit past the cap"
+        );
+    }
+
+    #[test]
+    fn complete_cert_does_not_release_incomplete_private_key() {
+        let mut buf = b"-----BEGIN CERTIFICATE-----\nCERTDATA\n-----END CERTIFICATE-----\n-----BEGIN RSA PRIVATE KEY-----\n".to_vec();
+        buf.extend(std::iter::repeat_n(b'B', 600));
+        let emit = safe_emit_len(&buf, 512);
+        let visible = &buf[..emit];
+        let text = String::from_utf8_lossy(visible);
+        assert!(
+            !text.contains("PRIVATE KEY"),
+            "incomplete private key must stay held after a closed cert: {text:?}"
+        );
+        assert!(
+            !text.contains("BEGIN RSA"),
+            "key header must not leak: {text:?}"
+        );
+
+        let mut r = StreamingRedactor::svarm(512);
+        let first = r.push(&buf);
+        let first_text = String::from_utf8_lossy(&first);
+        assert!(
+            !first_text.contains("PRIVATE KEY"),
+            "push must not emit key body: {first_text:?}"
+        );
+        assert!(
+            !first_text.contains("BBBB"),
+            "key body must not leak: {first_text:?}"
         );
     }
 }

@@ -357,28 +357,44 @@ mod tests {
 
     #[test]
     fn second_push_after_cap_still_holds_key_body() {
-        let mut body = b"-----BEGIN RSA PRIVATE KEY-----\n".to_vec();
-        body.extend(std::iter::repeat_n(b'A', PEM_HOLD_CAP + 200));
+        let header = b"-----BEGIN RSA PRIVATE KEY-----\n";
+        let overflow = 200;
+        let window_marker = b"WINDOWMARKER16KNOTIN512";
+        let marker_at = 1000;
+        assert!(
+            marker_at + window_marker.len() < PEM_HOLD_CAP - 512,
+            "marker must sit in the leftover 16KiB that a 512-byte holdback would emit"
+        );
+
+        let mut remaining = vec![b'A'; PEM_HOLD_CAP];
+        remaining[marker_at..marker_at + window_marker.len()].copy_from_slice(window_marker);
+
+        let mut body = header.to_vec();
+        body.extend(std::iter::repeat_n(b'A', overflow));
+        body.extend_from_slice(&remaining);
+
         let mut r = StreamingRedactor::svarm(512);
         let first = r.push(&body);
-        assert!(!first.is_empty(), "first push must release past the cap");
-
-        let marker = b"SECONDPUSHKEYBODY";
-        let second = r.push(marker);
-        let second_text = String::from_utf8_lossy(&second);
-        assert!(
-            !second_text.contains("SECONDPUSHKEYBODY"),
-            "remaining key body must stay held after BEGIN was drained: {second_text:?}"
-        );
-        let without_begin = body[b"-----BEGIN RSA PRIVATE KEY-----\n".len()..].to_vec();
-        let dumped = safe_emit_len_for_hold(&without_begin, 512, false);
-        assert!(
-            dumped > PEM_HOLD_CAP / 2,
-            "without the hold flag the body would dump under normal holdback"
-        );
         assert_eq!(
-            safe_emit_len_for_hold(&without_begin, 512, true),
-            without_begin.len().saturating_sub(PEM_HOLD_CAP)
+            first.len(),
+            header.len() + overflow,
+            "first push emits only past the 16KiB cap"
+        );
+
+        let extra = b"XXXXOVERFLOWXXXX";
+        let second = r.push(extra);
+        // Pre-fix dump would be ~PEM_HOLD_CAP - 512 + extra.len() and would
+        // include window_marker. Cap hold emits only the overflow past 16KiB.
+        assert_eq!(
+            second.len(),
+            extra.len(),
+            "second emit must be only overflow past PEM_HOLD_CAP, got {}",
+            second.len()
+        );
+        assert!(
+            !second.windows(window_marker.len()).any(|w| w == window_marker),
+            "16KiB-window marker must stay held: {}",
+            String::from_utf8_lossy(&second)
         );
     }
 

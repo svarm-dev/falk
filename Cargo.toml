@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/falk-cli",
+    "crates/falk-config",
+    "crates/falk-pty",
+    "crates/falk-security",
+    "crates/falk-finops",
+    "crates/falk-telemetry",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["falk contributors"]
+repository = "https://github.com/svarm-dev/falk"
+description = "Standalone PTY runtime sentinel and opt-in Svärm FinOps circuit breaker for AI coding agents"
+
+[workspace.dependencies]
+falk-config = { path = "crates/falk-config" }
+falk-pty = { path = "crates/falk-pty" }
+falk-security = { path = "crates/falk-security" }
+falk-finops = { path = "crates/falk-finops" }
+falk-telemetry = { path = "crates/falk-telemetry" }
+
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+portable-pty = "0.9"
+nix = { version = "0.30", features = ["process", "signal", "term", "fs"] }
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "io-util"] }
+bytes = "1.10"
+regex = "1.11"
+aho-corasick = "1.1"
+rust_decimal = { version = "1.37", features = ["serde"] }
+tree-sitter = "0.25"
+tree-sitter-bash = "0.25"
+crossterm = "0.29"
+libc = "0.2"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

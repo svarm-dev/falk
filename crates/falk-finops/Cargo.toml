@@ -1,0 +1,19 @@
+[package]
+name = "falk-finops"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "USD cost accumulator, usage parsers, and sliding-window loop breaker"
+
+[dependencies]
+falk-config.workspace = true
+falk-pty.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

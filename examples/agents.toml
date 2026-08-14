@@ -1,0 +1,41 @@
+# Example Svärm agents.toml wrappers.
+#
+# Svärm's Runner.Cli invokes the configured command via Port.open (non-PTY).
+# Wrap the real agent with falk --svarm so:
+#   - the Port sees plain stdio (compatible)
+#   - the agent still gets an inner PTY
+#   - mid-run FinOps killpg is available (Svärm Budget is preflight-only)
+#   - NDJSON usage events can be mapped onto Usage.Record
+#
+# falk never writes Task status / wait_reason / pending_question / attempts.
+
+[agents.claude]
+# Drop-in wrapper on the existing Runner.Cli Port path.
+command = "falk"
+args = [
+    "--svarm",
+    "--hard-limit", "2.50",
+    "--ndjson", "falk-events.ndjson",
+    "--",
+    "claude",
+]
+
+[agents.aider]
+command = "falk"
+args = [
+    "--svarm",
+    "-c", "falk.toml",
+    "--",
+    "aider",
+    "--yes-always",
+]
+
+[agents.codex]
+command = "falk"
+args = [
+    "--svarm",
+    "--run-id", "${SVARM_RUN_ID}",
+    "--task-id", "${SVARM_TASK_ID}",
+    "--",
+    "codex",
+]

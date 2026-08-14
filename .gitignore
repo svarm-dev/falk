@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+.idea/
+.vscode/
+*.swp
+falk-events.ndjson
+.agents/
+.grok/
+skills-lock.json
+

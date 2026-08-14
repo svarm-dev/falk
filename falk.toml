@@ -1,0 +1,91 @@
+# Example falk.toml — layered under CLI flags and FALK_* environment variables.
+# Precedence: CLI flags > env (FALK_*) > this file > built-in defaults.
+#
+# Dual identity:
+#   standalone (default) — fully useful with zero Svärm knowledge.
+#   svarm                — opt-in via --svarm, [svarm] enabled = true, or FALK_SVARM.
+
+[general]
+mode = "standalone"
+# Optional ticket / correlation id (Svärm-mode injection only; never a Task field).
+ticket = ""
+
+[pty]
+rows = 24
+cols = 80
+# Grace period between killpg(SIGTERM) and killpg(SIGKILL) on a hard action.
+kill_grace_ms = 1500
+# Enable raw-mode stdin/stdout when the outer fd is a TTY (standalone only).
+raw_mode = true
+
+[security]
+# fail-closed: unknown / too-complex AST nodes produce a finding.
+enforcement = "block"
+max_ast_depth = 64
+max_ast_nodes = 4096
+
+[security.allowlist]
+# Empty = all commands allowed (still subject to blocklist / fail-closed walk).
+commands = []
+
+[security.blocklist]
+commands = []
+sensitive_paths = [
+    "/etc/shadow",
+    "/etc/sudoers",
+    "~/.ssh",
+]
+
+[security.network]
+allowed_domains = []
+blocked_domains = []
+
+[security.redaction]
+enabled = true
+holdback_bytes = 512
+
+[finops]
+# soft_limit_usd = "1.00"   # warn only
+# hard_limit_usd = "2.50"   # killpg mid-run (Svärm Budget does not cover this)
+max_prompt_tokens = 0
+max_completion_tokens = 0
+# When a provider usage event has no cost, estimate from [finops.providers.*].
+estimator = true
+
+[finops.loop]
+window = 8
+repeat_threshold = 4
+# Failure markers that, together with a repeated command fingerprint, trip the breaker.
+failure_markers = [
+    "error",
+    "failed",
+    "permission denied",
+    "traceback",
+]
+
+[finops.providers.anthropic]
+input_per_mtok = "3.00"
+output_per_mtok = "15.00"
+cache_read_per_mtok = "0.30"
+cache_write_per_mtok = "3.75"
+
+[finops.providers.openai]
+input_per_mtok = "2.50"
+output_per_mtok = "10.00"
+cache_read_per_mtok = "1.25"
+cache_write_per_mtok = "2.50"
+
+[svarm]
+# Svärm mode is opt-in. Default remains standalone.
+enabled = false
+run_id = ""
+task_id = ""
+# NDJSON side-channel path. Never mixed into agent stdout.
+# Svärm's Runner.Cli uses Port.open (non-PTY) + :stderr_to_stdout, so events
+# must not go to stderr. Empty = "falk-events.ndjson" when mode is svarm.
+ndjson_path = ""
+# Optional extra fd for NDJSON (e.g. 3). 0 = unset.
+ndjson_fd = 0
+
+[tracing]
+level = "warn"

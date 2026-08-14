@@ -159,13 +159,43 @@ impl StreamingRedactor {
             self.pending.clear();
             return redacted.into_bytes();
         }
-        if self.pending.len() > self.holdback {
-            let emit_len = self.pending.len() - self.holdback;
+        let emit_len = safe_emit_len(&self.pending, self.holdback);
+        if emit_len > 0 {
             self.pending.drain(..emit_len).collect()
         } else {
             Vec::new()
         }
     }
+}
+
+/// Max bytes held after an unmatched `-----BEGIN ` (covers a 4096-bit PEM).
+const PEM_HOLD_CAP: usize = 16 * 1024;
+const PEM_BEGIN: &[u8] = b"-----BEGIN ";
+const PEM_END: &[u8] = b"-----END ";
+
+/// How many leading pending bytes are safe to emit. Shipped so tests drive
+/// the same hold-back rule as `StreamingRedactor::push`.
+pub fn safe_emit_len(pending: &[u8], holdback: usize) -> usize {
+    let holdback = holdback.max(32);
+    let normal = pending.len().saturating_sub(holdback);
+    match open_pem_start(pending) {
+        Some(start) if pending.len() - start > PEM_HOLD_CAP => start,
+        Some(start) => start.min(normal),
+        None => normal,
+    }
+}
+
+fn open_pem_start(buf: &[u8]) -> Option<usize> {
+    let begin = find_bytes(buf, PEM_BEGIN)?;
+    if find_bytes(&buf[begin..], PEM_END).is_some() {
+        None
+    } else {
+        Some(begin)
+    }
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -215,5 +245,40 @@ mod tests {
         );
         assert!(text.contains("prefix"), "{text:?}");
         assert!(text.contains("suffix"), "{text:?}");
+    }
+
+    #[test]
+    fn pem_split_across_push_does_not_leak_begin() {
+        let mut body = b"-----BEGIN RSA PRIVATE KEY-----\n".to_vec();
+        body.extend(std::iter::repeat_n(b'A', 600));
+        assert!(
+            body.len() > 512,
+            "first chunk must exceed default hold-back"
+        );
+        assert!(
+            !body.windows(b"-----END ".len()).any(|w| w == b"-----END "),
+            "first chunk must not contain END"
+        );
+
+        let mut r = StreamingRedactor::svarm(512);
+        let first = r.push(&body);
+        let first_text = String::from_utf8_lossy(&first);
+        assert!(
+            !first_text.contains("BEGIN"),
+            "open PEM must stay in the hold window: {first_text:?}"
+        );
+
+        let second = r.push(b"\n-----END RSA PRIVATE KEY-----\n");
+        let tail = r.flush();
+        let all = [first, second, tail].concat();
+        let text = String::from_utf8_lossy(&all);
+        assert!(
+            !text.contains("BEGIN RSA"),
+            "PEM body must not leak: {text:?}"
+        );
+        assert!(
+            text.contains("[redacted pem]"),
+            "must use Svarm.Redact PEM replacement: {text:?}"
+        );
     }
 }

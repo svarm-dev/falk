@@ -123,7 +123,11 @@ const KNOWN_KINDS: &[&str] = &[
     "file_redirect",
 ];
 
-const INTERPRETERS: &[&str] = &["bash", "sh", "dash", "zsh", "ksh", "ash", "busybox", "env"];
+const SHELL_INTERPRETERS: &[&str] = &["bash", "sh", "dash", "zsh", "ksh", "ash"];
+const SCRIPT_INTERPRETERS: &[&str] = &[
+    "python", "python3", "node", "nodejs", "ruby", "perl", "lua",
+];
+const WRAPPERS: &[&str] = &["env", "busybox"];
 
 const MAX_REPARSE_DEPTH: usize = 8;
 
@@ -312,31 +316,80 @@ fn maybe_reparse_nested(
         return;
     }
     let base = cmd_basename(&cmd.name);
+    if let Some((name, args)) = wrapped_command(base, &cmd.args) {
+        let inner = ExtractedCommand { name, args };
+        maybe_reparse_nested(
+            &inner,
+            max_depth,
+            max_nodes,
+            reparse_depth + 1,
+            findings,
+            commands,
+        );
+        commands.push(inner);
+        return;
+    }
     let nested = nested_script(base, &cmd.args);
     if let Some(script) = nested {
-        let inner = walk_bash_inner(script, max_depth, max_nodes, reparse_depth + 1);
-        for f in inner.findings {
-            findings.push(WalkFinding::Nested { inner: Box::new(f) });
+        if SCRIPT_INTERPRETERS.contains(&base) {
+            // python/node/perl source is not bash; walk quoted snippets
+            // so `os.system('rm …')` still yields `rm`.
+            for snippet in quoted_snippets(script) {
+                let more = walk_bash_inner(snippet, max_depth, max_nodes, reparse_depth + 1);
+                commands.extend(more.commands);
+            }
+        } else {
+            let inner = walk_bash_inner(script, max_depth, max_nodes, reparse_depth + 1);
+            for f in inner.findings {
+                findings.push(WalkFinding::Nested { inner: Box::new(f) });
+            }
+            commands.extend(inner.commands);
         }
-        commands.extend(inner.commands);
     }
+}
+
+fn quoted_snippets(script: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = script.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let quote = bytes[i];
+        if quote == b'\'' || quote == b'"' {
+            if let Some(rel) = bytes[i + 1..].iter().position(|&b| b == quote) {
+                let start = i + 1;
+                let end = start + rel;
+                if end > start {
+                    out.push(&script[start..end]);
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 fn cmd_basename(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
-/// Interpreters are not blanket-blocked. When we see `bash -c SCRIPT` or
-/// `eval SCRIPT`, re-parse SCRIPT.
+/// Interpreters are not blanket-blocked. When we see `bash -c SCRIPT`,
+/// `python -c SCRIPT`, `node -e SCRIPT`, or `eval SCRIPT`, re-parse SCRIPT.
 fn nested_script<'a>(base: &str, args: &'a [String]) -> Option<&'a str> {
-    if INTERPRETERS.contains(&base) {
+    if SHELL_INTERPRETERS.contains(&base) || SCRIPT_INTERPRETERS.contains(&base) {
         let mut i = 0;
         while i < args.len() {
             let a = args[i].as_str();
-            if a == "-c" || a == "--command" {
+            if a == "-c" || a == "--command" || a == "-e" || a == "--eval" {
                 return args.get(i + 1).map(String::as_str);
             }
-            if a.starts_with('-') && a.contains('c') && a != "-" && a != "--" {
+            if SHELL_INTERPRETERS.contains(&base)
+                && a.starts_with('-')
+                && a.contains('c')
+                && a != "-"
+                && a != "--"
+            {
                 // `bash -lc SCRIPT`
                 return args.get(i + 1).map(String::as_str);
             }
@@ -347,6 +400,37 @@ fn nested_script<'a>(base: &str, args: &'a [String]) -> Option<&'a str> {
         return args.first().map(String::as_str);
     }
     None
+}
+
+/// `env CMD …` / `busybox CMD …`: the real argv0 is the first non-option word.
+pub fn wrapped_command(base: &str, args: &[String]) -> Option<(String, Vec<String>)> {
+    if !WRAPPERS.contains(&base) {
+        return None;
+    }
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.contains('=') && !a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if a.starts_with('-') {
+            if matches!(a, "-u" | "-C" | "--unset" | "--chdir") {
+                i = i.saturating_add(2);
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let name = args.get(i)?.clone();
+    let rest = args[i + 1..].to_vec();
+    Some((name, rest))
 }
 
 /// Classify a tree-sitter node kind. The walker calls this for every node;
@@ -404,18 +488,35 @@ mod tests {
         let out = walk(r#"bash -c "rm -rf /tmp/falk-demo""#);
         let names: Vec<_> = out.commands.iter().map(|c| c.name.as_str()).collect();
         assert!(
-            names.iter().any(|n| *n == "rm"),
+            names.contains(&"rm"),
             "nested rm must be extracted, got {names:?}"
         );
         // bash itself is recorded but is an interpreter, not a finding.
-        assert!(names.iter().any(|n| *n == "bash"), "{names:?}");
+        assert!(names.contains(&"bash"), "{names:?}");
     }
 
     #[test]
     fn eval_is_reparsed() {
         let out = walk(r#"eval "cat /etc/shadow""#);
         let names: Vec<_> = out.commands.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.iter().any(|n| *n == "cat"), "{names:?}");
+        assert!(names.contains(&"cat"), "{names:?}");
+    }
+
+    #[test]
+    fn env_and_python_c_extract_inner_command() {
+        let env = walk("env rm -rf /tmp/x");
+        let names: Vec<_> = env.commands.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"rm"),
+            "env wrapper must yield rm, got {names:?}"
+        );
+
+        let py = walk(r#"python -c "import os; os.system('rm -rf /tmp/x')""#);
+        let names: Vec<_> = py.commands.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"rm"),
+            "python -c payload must yield rm, got {names:?}"
+        );
     }
 
     #[test]

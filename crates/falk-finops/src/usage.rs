@@ -178,11 +178,14 @@ fn first_decimal(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<
                     return Some(d);
                 }
             }
-            if let Some(f) = v.as_f64() {
-                return f.to_string().parse().ok();
-            }
             if let Some(n) = v.as_i64() {
                 return Some(Decimal::from(n));
+            }
+            if let Some(n) = v.as_u64() {
+                return Some(Decimal::from(n));
+            }
+            if let Some(num) = v.as_number() {
+                return num.to_string().parse().ok();
             }
         }
     }
@@ -215,5 +218,18 @@ mod tests {
         assert_eq!(ev[0].provider.as_deref(), Some("anthropic"));
         assert!(ev[0].provider_cost_usd.is_some());
         assert!(!ev[0].estimated);
+    }
+
+    #[test]
+    fn json_number_cost_uses_decimal_digits_not_f64() {
+        let ev = parse_usage_events(
+            r#"{"provider":"openai","provider_cost_usd":0.10,"usage":{"prompt_tokens":1,"completion_tokens":0}}"#,
+        );
+        assert_eq!(ev.len(), 1);
+        assert_eq!(
+            ev[0].provider_cost_usd,
+            Some("0.10".parse().unwrap()),
+            "JSON number must parse via its digit string, not f64"
+        );
     }
 }

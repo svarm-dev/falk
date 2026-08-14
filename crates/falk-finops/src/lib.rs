@@ -61,6 +61,7 @@ impl FinopsEngine {
             }
             outcome.events.push(priced);
         }
+        note_commands_from_chunk(&mut self.loops, chunk);
         if let Some(trip) = self.loops.observe_chunk(chunk) {
             outcome.decisions.push(LimitDecision::Loop {
                 reason: trip.reason,
@@ -68,6 +69,24 @@ impl FinopsEngine {
             });
         }
         outcome
+    }
+}
+
+fn note_commands_from_chunk(loops: &mut LoopDetector, chunk: &str) {
+    for line in chunk.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('{') || trimmed.starts_with('[') {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if loops
+            .failure_markers()
+            .iter()
+            .any(|m| lower.contains(&m.to_ascii_lowercase()))
+        {
+            continue;
+        }
+        loops.note_command(trimmed);
     }
 }
 
@@ -194,5 +213,37 @@ mod tests {
             });
         }
         assert!(tripped.is_some(), "sliding window must trip");
+    }
+
+    #[test]
+    fn ingest_identical_error_without_command_does_not_loop_kill() {
+        let cfg = FinopsConfig::default();
+        let mut engine = FinopsEngine::from_config(&cfg);
+        let mut last = None;
+        for _ in 0..cfg.loop_detect.repeat_threshold {
+            let outcome = engine.ingest_chunk("Error: retry\n", &cfg);
+            last = outcome
+                .decisions
+                .into_iter()
+                .find(|d| matches!(d, LimitDecision::Loop { .. }));
+        }
+        assert!(
+            last.is_none(),
+            "command_fp == 0 must not hard-kill: {last:?}"
+        );
+
+        engine.loops.note_command("cat /etc/shadow");
+        let mut tripped = None;
+        for _ in 0..cfg.loop_detect.repeat_threshold {
+            let outcome = engine.ingest_chunk("Error: retry\n", &cfg);
+            tripped = outcome
+                .decisions
+                .into_iter()
+                .find(|d| matches!(d, LimitDecision::Loop { .. }));
+        }
+        assert!(
+            tripped.is_some(),
+            "repeated failed command fingerprint must still trip"
+        );
     }
 }

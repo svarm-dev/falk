@@ -71,7 +71,7 @@ impl FromStr for EnforcementMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub general: GeneralConfig,
@@ -85,19 +85,6 @@ pub struct Config {
     pub svarm: SvarmConfig,
     #[serde(default)]
     pub tracing: TracingConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            pty: PtyConfig::default(),
-            security: SecurityConfig::default(),
-            finops: FinopsConfig::default(),
-            svarm: SvarmConfig::default(),
-            tracing: TracingConfig::default(),
-        }
-    }
 }
 
 impl Config {
@@ -291,11 +278,9 @@ where
         None => Ok(None),
         Some(toml::Value::String(s)) if s.trim().is_empty() => Ok(None),
         Some(toml::Value::String(s)) => s.parse().map(Some).map_err(serde::de::Error::custom),
-        Some(toml::Value::Float(f)) => f
-            .to_string()
-            .parse()
-            .map(Some)
-            .map_err(serde::de::Error::custom),
+        Some(toml::Value::Float(_)) => Err(serde::de::Error::custom(
+            "USD values must be quoted decimal strings (e.g. \"0.10\"), not toml floats",
+        )),
         Some(toml::Value::Integer(i)) => Ok(Some(Decimal::from(i))),
         Some(other) => Err(serde::de::Error::custom(format!(
             "invalid decimal: {other}"
@@ -507,10 +492,10 @@ where
                 out.config_path = Some(PathBuf::from(value));
             }
             "HARD_LIMIT" | "HARD_LIMIT_USD" => {
-                out.hard_limit = Some(parse_decimal("FALK_HARD_LIMIT", value)?);
+                out.hard_limit = parse_optional_decimal("FALK_HARD_LIMIT", value)?;
             }
             "SOFT_LIMIT" | "SOFT_LIMIT_USD" => {
-                out.soft_limit = Some(parse_decimal("FALK_SOFT_LIMIT", value)?);
+                out.soft_limit = parse_optional_decimal("FALK_SOFT_LIMIT", value)?;
             }
             "SVARM" => {
                 out.svarm = Some(parse_bool(value));
@@ -554,11 +539,17 @@ fn parse_bool(value: &str) -> bool {
     )
 }
 
-fn parse_decimal(key: &str, value: &str) -> Result<Decimal, ConfigError> {
-    Decimal::from_str(value.trim()).map_err(|_| ConfigError::InvalidValue {
-        key: key.into(),
-        value: value.into(),
-    })
+fn parse_optional_decimal(key: &str, value: &str) -> Result<Option<Decimal>, ConfigError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Decimal::from_str(trimmed)
+        .map(Some)
+        .map_err(|_| ConfigError::InvalidValue {
+            key: key.into(),
+            value: value.into(),
+        })
 }
 
 /// Merge layers. CLI wins, then env, then file, then `defaults`.
@@ -588,6 +579,9 @@ pub fn merge(
     }
     if let Some(false) = env.svarm {
         cfg.svarm.enabled = false;
+        if env.mode.is_none() {
+            cfg.general.mode = Mode::Standalone;
+        }
     }
     if let Some(limit) = env.hard_limit {
         cfg.finops.hard_limit_usd = Some(limit);
@@ -789,5 +783,34 @@ mod tests {
         .unwrap();
         assert_eq!(env.hard_limit, Some(dec("3.25")));
         assert_eq!(env.enforcement, Some(EnforcementMode::Kill));
+    }
+
+    #[test]
+    fn env_svarm_false_clears_file_mode_svarm() {
+        let file = parse_toml("[general]\nmode = \"svarm\"\n").unwrap();
+        let env = env_overrides_from_pairs([("FALK_SVARM", "false")]).unwrap();
+        let merged = merge(&CliOverrides::default(), &env, Some(&file), Config::default());
+        assert_eq!(merged.effective_mode(), Mode::Standalone);
+        assert!(!merged.svarm.enabled);
+    }
+
+    #[test]
+    fn empty_env_usd_is_unset_and_unquoted_float_is_rejected() {
+        let env = env_overrides_from_pairs([
+            ("FALK_HARD_LIMIT", ""),
+            ("FALK_SOFT_LIMIT", "   "),
+        ])
+        .expect("blank FALK_* USD must not be a parse error");
+        assert_eq!(env.hard_limit, None);
+        assert_eq!(env.soft_limit, None);
+        let err = parse_toml("[finops]\nhard_limit_usd = 0.1\n")
+            .expect_err("unquoted toml float must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("quoted") || msg.contains("float") || msg.contains("decimal"),
+            "{msg}"
+        );
+        let ok = parse_toml("[finops]\nhard_limit_usd = \"0.10\"\n").unwrap();
+        assert_eq!(ok.finops.hard_limit_usd, Some(dec("0.10")));
     }
 }

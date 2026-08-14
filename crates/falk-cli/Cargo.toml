@@ -22,7 +22,6 @@ clap.workspace = true
 rust_decimal.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-crossterm.workspace = true
 nix.workspace = true
 
 [dev-dependencies]

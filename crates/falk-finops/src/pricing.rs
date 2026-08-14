@@ -26,10 +26,10 @@ pub fn estimate_usd(event: &UsageEvent, providers: &BTreeMap<String, ProviderPri
 
 /// Resolve a pricing row. Tries `provider/model`, then `provider`, then
 /// a conservative default (openai-like).
-pub fn lookup_pricing<'a>(
+pub fn lookup_pricing(
     provider: Option<&str>,
     model: Option<&str>,
-    providers: &'a BTreeMap<String, ProviderPricing>,
+    providers: &BTreeMap<String, ProviderPricing>,
 ) -> ProviderPricing {
     if let (Some(p), Some(m)) = (provider, model) {
         let key = format!("{p}/{m}");

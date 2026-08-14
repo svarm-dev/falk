@@ -21,9 +21,26 @@ use falk_security::{Verdict, inspect_chunk};
 use falk_telemetry::{Emitter, Event, LimitKind, usage_record};
 use tracing::{debug, warn};
 
+#[derive(Debug)]
 enum Action {
     Kill { reason: String },
+    Block { reason: String },
     Warn { message: String },
+}
+
+/// Map a security verdict onto a runtime action. Shipped so Block stays
+/// distinct from Warn (issue #11).
+fn action_from_verdict(verdict: Verdict) -> Option<Action> {
+    match verdict {
+        Verdict::Allow => None,
+        Verdict::Warn { reason } => Some(Action::Warn {
+            message: format!("security: {reason}"),
+        }),
+        Verdict::Block { reason } => Some(Action::Block { reason }),
+        Verdict::Kill { reason } => Some(Action::Kill {
+            reason: format!("security: {reason}"),
+        }),
+    }
 }
 
 pub fn run_wrapped(argv: &[String], cfg: &Config) -> anyhow::Result<ExitCode> {
@@ -176,23 +193,8 @@ fn run_event_loop(
         .spawn(move || {
             while let Ok(chunk) = sec_rx.recv() {
                 let text = String::from_utf8_lossy(&chunk);
-                match inspect_chunk(&text, &security_cfg) {
-                    Verdict::Allow => {}
-                    Verdict::Warn { reason } => {
-                        let _ = sec_actions.send(Action::Warn {
-                            message: format!("security: {reason}"),
-                        });
-                    }
-                    Verdict::Block { reason } => {
-                        let _ = sec_actions.send(Action::Warn {
-                            message: format!("security block: {reason}"),
-                        });
-                    }
-                    Verdict::Kill { reason } => {
-                        let _ = sec_actions.send(Action::Kill {
-                            reason: format!("security: {reason}"),
-                        });
-                    }
+                if let Some(action) = action_from_verdict(inspect_chunk(&text, &security_cfg)) {
+                    let _ = sec_actions.send(action);
                 }
             }
         })
@@ -317,6 +319,16 @@ fn run_event_loop(
                             message,
                         });
                     }
+                }
+                Action::Block { reason } => {
+                    eprintln!("falk: blocking: {reason}");
+                    if let Some(em) = emitter {
+                        let _ = em.emit(&Event::Security {
+                            verdict: "block".into(),
+                            reason: reason.clone(),
+                        });
+                    }
+                    let _ = supervisor.signal_group(SignalKind::Int);
                 }
                 Action::Kill { reason } => {
                     eprintln!("falk: killing process tree: {reason}");
@@ -462,6 +474,26 @@ mod tests {
             "joining a blocked stdin pump would hang past the child's exit"
         );
         drop(hold_tx);
+    }
+
+    #[test]
+    fn block_verdict_is_not_warn() {
+        let warn = action_from_verdict(Verdict::Warn {
+            reason: "blocked command `rm`".into(),
+        });
+        let block = action_from_verdict(Verdict::Block {
+            reason: "blocked command `rm`".into(),
+        });
+        let kill = action_from_verdict(Verdict::Kill {
+            reason: "blocked command `rm`".into(),
+        });
+        assert!(matches!(warn, Some(Action::Warn { .. })), "{warn:?}");
+        assert!(
+            matches!(block, Some(Action::Block { .. })),
+            "Block must not collapse to Warn: {block:?}"
+        );
+        assert!(matches!(kill, Some(Action::Kill { .. })), "{kill:?}");
+        assert!(!matches!(block, Some(Action::Warn { .. })));
     }
 
     #[test]

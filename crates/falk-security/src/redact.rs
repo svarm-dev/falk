@@ -110,6 +110,9 @@ pub struct StreamingRedactor {
     holdback: usize,
     style: RedactStyle,
     enabled: bool,
+    /// True after we have seen an unmatched private-key BEGIN. Stays set
+    /// after the header is emitted by the 16 KiB cap so the body is still held.
+    holding_private_key: bool,
 }
 
 impl StreamingRedactor {
@@ -119,6 +122,7 @@ impl StreamingRedactor {
             holdback: holdback.max(32),
             style,
             enabled,
+            holding_private_key: false,
         }
     }
 
@@ -142,11 +146,13 @@ impl StreamingRedactor {
     /// Flush remaining bytes (end of stream). Always redact the tail.
     pub fn flush(&mut self) -> Vec<u8> {
         if !self.enabled {
+            self.holding_private_key = false;
             return std::mem::take(&mut self.pending);
         }
         let text = String::from_utf8_lossy(&self.pending);
         let redacted = redact_text(&text, self.style);
         self.pending.clear();
+        self.holding_private_key = false;
         redacted.into_bytes()
     }
 
@@ -157,15 +163,93 @@ impl StreamingRedactor {
             // A complete secret was matched. Emit the redacted form and reset
             // so we do not re-emit the original suffix later.
             self.pending.clear();
+            self.holding_private_key = false;
             return redacted.into_bytes();
         }
-        if self.pending.len() > self.holdback {
-            let emit_len = self.pending.len() - self.holdback;
+        if open_pem_start(&self.pending).is_some() {
+            self.holding_private_key = true;
+        }
+        let emit_len = safe_emit_len_for_hold(
+            &self.pending,
+            self.holdback,
+            self.holding_private_key,
+        );
+        let out = if emit_len > 0 {
             self.pending.drain(..emit_len).collect()
         } else {
             Vec::new()
+        };
+        if has_end_private_key(&self.pending) && open_pem_start(&self.pending).is_none() {
+            self.holding_private_key = false;
+        }
+        out
+    }
+}
+
+/// Max bytes held after an unmatched private-key BEGIN (covers a 4096-bit PEM).
+const PEM_HOLD_CAP: usize = 16 * 1024;
+const PEM_BEGIN: &[u8] = b"-----BEGIN ";
+const PEM_END: &[u8] = b"-----END ";
+const PRIVATE_KEY: &[u8] = b"PRIVATE KEY";
+
+/// How many leading pending bytes are safe to emit. Shipped so tests drive
+/// the same hold-back rule as `StreamingRedactor::push`.
+pub fn safe_emit_len(pending: &[u8], holdback: usize) -> usize {
+    let holding = open_pem_start(pending).is_some();
+    safe_emit_len_for_hold(pending, holdback, holding)
+}
+
+/// `holding_private_key` stays true after a cap overflow has already emitted
+/// the BEGIN header, so the remaining body is still held to `PEM_HOLD_CAP`.
+pub fn safe_emit_len_for_hold(pending: &[u8], holdback: usize, holding_private_key: bool) -> usize {
+    let holdback = holdback.max(32);
+    let normal = pending.len().saturating_sub(holdback);
+    match open_pem_start(pending) {
+        Some(start) if pending.len() - start > PEM_HOLD_CAP => pending.len() - PEM_HOLD_CAP,
+        Some(start) => start.min(normal),
+        None if holding_private_key => pending.len().saturating_sub(PEM_HOLD_CAP),
+        None => normal,
+    }
+}
+
+/// Offset of the last unmatched `BEGIN … PRIVATE KEY` header, if any.
+fn open_pem_start(buf: &[u8]) -> Option<usize> {
+    let mut last_open = None;
+    let mut search = 0;
+    while let Some(rel) = find_bytes(&buf[search..], PEM_BEGIN) {
+        let start = search + rel;
+        let header = header_line(buf, start);
+        search = start + PEM_BEGIN.len();
+        if find_bytes(header, PRIVATE_KEY).is_none() {
+            continue;
+        }
+        if !has_end_private_key(&buf[start..]) {
+            last_open = Some(start);
         }
     }
+    last_open
+}
+
+fn header_line(buf: &[u8], start: usize) -> &[u8] {
+    let rest = &buf[start..];
+    let end = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+    &rest[..end]
+}
+
+fn has_end_private_key(buf: &[u8]) -> bool {
+    let mut search = 0;
+    while let Some(rel) = find_bytes(&buf[search..], PEM_END) {
+        let at = search + rel;
+        if find_bytes(header_line(buf, at), PRIVATE_KEY).is_some() {
+            return true;
+        }
+        search = at + PEM_END.len();
+    }
+    false
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -215,5 +299,131 @@ mod tests {
         );
         assert!(text.contains("prefix"), "{text:?}");
         assert!(text.contains("suffix"), "{text:?}");
+    }
+
+    #[test]
+    fn pem_split_across_push_does_not_leak_begin() {
+        let mut body = b"-----BEGIN RSA PRIVATE KEY-----\n".to_vec();
+        body.extend(std::iter::repeat_n(b'A', 600));
+        assert!(
+            body.len() > 512,
+            "first chunk must exceed default hold-back"
+        );
+        assert!(
+            !body.windows(b"-----END ".len()).any(|w| w == b"-----END "),
+            "first chunk must not contain END"
+        );
+
+        let mut r = StreamingRedactor::svarm(512);
+        let first = r.push(&body);
+        let first_text = String::from_utf8_lossy(&first);
+        assert!(
+            !first_text.contains("BEGIN"),
+            "open PEM must stay in the hold window: {first_text:?}"
+        );
+
+        let second = r.push(b"\n-----END RSA PRIVATE KEY-----\n");
+        let tail = r.flush();
+        let all = [first, second, tail].concat();
+        let text = String::from_utf8_lossy(&all);
+        assert!(
+            !text.contains("BEGIN RSA"),
+            "PEM body must not leak: {text:?}"
+        );
+        assert!(
+            text.contains("[redacted pem]"),
+            "must use Svarm.Redact PEM replacement: {text:?}"
+        );
+    }
+
+    #[test]
+    fn open_pem_past_cap_emits_oldest_bytes() {
+        let mut body = b"-----BEGIN RSA PRIVATE KEY-----\n".to_vec();
+        body.extend(std::iter::repeat_n(b'A', PEM_HOLD_CAP + 200));
+        let emit = safe_emit_len(&body, 512);
+        assert!(
+            emit > 0,
+            "cap must release bytes so pending does not grow forever"
+        );
+        assert_eq!(emit, body.len() - PEM_HOLD_CAP);
+
+        let mut r = StreamingRedactor::svarm(512);
+        let visible = r.push(&body);
+        assert!(
+            !visible.is_empty(),
+            "StreamingRedactor::push must emit past the cap"
+        );
+    }
+
+    #[test]
+    fn second_push_after_cap_still_holds_key_body() {
+        let header = b"-----BEGIN RSA PRIVATE KEY-----\n";
+        let overflow = 200;
+        let window_marker = b"WINDOWMARKER16KNOTIN512";
+        let marker_at = 1000;
+        assert!(
+            marker_at + window_marker.len() < PEM_HOLD_CAP - 512,
+            "marker must sit in the leftover 16KiB that a 512-byte holdback would emit"
+        );
+
+        let mut remaining = vec![b'A'; PEM_HOLD_CAP];
+        remaining[marker_at..marker_at + window_marker.len()].copy_from_slice(window_marker);
+
+        let mut body = header.to_vec();
+        body.extend(std::iter::repeat_n(b'A', overflow));
+        body.extend_from_slice(&remaining);
+
+        let mut r = StreamingRedactor::svarm(512);
+        let first = r.push(&body);
+        assert_eq!(
+            first.len(),
+            header.len() + overflow,
+            "first push emits only past the 16KiB cap"
+        );
+
+        let extra = b"XXXXOVERFLOWXXXX";
+        let second = r.push(extra);
+        // Pre-fix dump would be ~PEM_HOLD_CAP - 512 + extra.len() and would
+        // include window_marker. Cap hold emits only the overflow past 16KiB.
+        assert_eq!(
+            second.len(),
+            extra.len(),
+            "second emit must be only overflow past PEM_HOLD_CAP, got {}",
+            second.len()
+        );
+        assert!(
+            !second.windows(window_marker.len()).any(|w| w == window_marker),
+            "16KiB-window marker must stay held: {}",
+            String::from_utf8_lossy(&second)
+        );
+    }
+
+    #[test]
+    fn complete_cert_does_not_release_incomplete_private_key() {
+        let mut buf = b"-----BEGIN CERTIFICATE-----\nCERTDATA\n-----END CERTIFICATE-----\n-----BEGIN RSA PRIVATE KEY-----\n".to_vec();
+        buf.extend(std::iter::repeat_n(b'B', 600));
+        let emit = safe_emit_len(&buf, 512);
+        let visible = &buf[..emit];
+        let text = String::from_utf8_lossy(visible);
+        assert!(
+            !text.contains("PRIVATE KEY"),
+            "incomplete private key must stay held after a closed cert: {text:?}"
+        );
+        assert!(
+            !text.contains("BEGIN RSA"),
+            "key header must not leak: {text:?}"
+        );
+
+        let mut r = StreamingRedactor::svarm(512);
+        let first = r.push(&buf);
+        let first_text = String::from_utf8_lossy(&first);
+        assert!(
+            !first_text.contains("PRIVATE KEY"),
+            "push must not emit key body: {first_text:?}"
+        );
+        assert!(
+            !first_text.contains("BBBB"),
+            "key body must not leak: {first_text:?}"
+        );
     }
 }

@@ -63,7 +63,7 @@ impl LoopDetector {
                     && s.failed == sample.failed
             })
             .count();
-        if sample.failed && repeats >= self.repeat_threshold {
+        if sample.command_fp != 0 && sample.failed && repeats >= self.repeat_threshold {
             Some(LoopTrip {
                 reason: format!(
                     "repeated command fingerprint {:#x} / output {:#x} with failure markers ({repeats}×)",

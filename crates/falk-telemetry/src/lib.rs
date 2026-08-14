@@ -94,8 +94,16 @@ impl Emitter {
                 #[cfg(unix)]
                 {
                     use std::os::fd::FromRawFd;
-                    // SAFETY: the caller transfers this fd to the emitter for the
-                    // process lifetime; File will close it on drop.
+                    if !is_safe_ndjson_fd(*fd) {
+                        return Err(TelemetryError::Io {
+                            path: format!("fd:{fd}"),
+                            message: "ndjson_fd must be a unique fd >= 3 (not stdin/stdout/stderr)"
+                                .into(),
+                        });
+                    }
+                    // SAFETY: fd is exclusive, >= 3, and owned by the emitter
+                    // for the process lifetime; File closes it on drop.
+                    #[allow(unsafe_code)]
                     Some(unsafe { File::from_raw_fd(*fd) })
                 }
                 #[cfg(not(unix))]
@@ -121,6 +129,13 @@ impl Emitter {
             return Ok(Some(Self::new(Sink::Path(PathBuf::from(path)))?));
         }
         if fd > 0 {
+            if !is_safe_ndjson_fd(fd) {
+                return Err(TelemetryError::Io {
+                    path: format!("fd:{fd}"),
+                    message: "ndjson_fd must be a unique fd >= 3 (not stdin/stdout/stderr)"
+                        .into(),
+                });
+            }
             return Ok(Some(Self::new(Sink::Fd(fd))?));
         }
         if svarm {
@@ -179,8 +194,14 @@ pub enum TelemetryError {
     Serialize(String),
 }
 
+/// Stdio fds must not be taken by `from_raw_fd` (Svärm mixes stderr into stdout).
+pub fn is_safe_ndjson_fd(fd: i32) -> bool {
+    fd >= 3
+}
+
 /// Incremental Usage.Record-shaped NDJSON event. Called once per parsed
 /// stream usage event (not only on hard-limit).
+#[allow(clippy::too_many_arguments)]
 pub fn usage_record(
     run_id: impl Into<String>,
     task_id: impl Into<String>,
@@ -209,6 +230,7 @@ pub fn usage_record(
 }
 
 /// Convenience wrapper used by tests that do not care about cache tokens.
+#[allow(clippy::too_many_arguments)]
 pub fn usage_event(
     run_id: impl Into<String>,
     task_id: impl Into<String>,
@@ -289,5 +311,21 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(body.contains("\"event\":\"warn\""));
         assert!(body.contains("hello"));
+    }
+
+    #[test]
+    fn from_config_rejects_stdio_fds() {
+        assert!(!is_safe_ndjson_fd(0));
+        assert!(!is_safe_ndjson_fd(1));
+        assert!(!is_safe_ndjson_fd(2));
+        assert!(is_safe_ndjson_fd(3));
+        match Emitter::from_config("", 2, true) {
+            Ok(_) => panic!("fd 2 must be rejected"),
+            Err(err) => assert!(err.to_string().contains("fd"), "{err}"),
+        }
+        match Emitter::from_config("", 1, true) {
+            Ok(_) => panic!("fd 1 must be rejected"),
+            Err(err) => assert!(err.to_string().contains("fd"), "{err}"),
+        }
     }
 }

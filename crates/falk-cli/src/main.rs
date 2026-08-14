@@ -96,9 +96,6 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
-    if let Err(err) = tracing_try_init() {
-        eprintln!("falk: tracing init failed: {err}");
-    }
     match run() {
         Ok(code) => code,
         Err(err) => {
@@ -108,15 +105,21 @@ fn main() -> ExitCode {
     }
 }
 
-fn tracing_try_init() -> Result<(), String> {
+/// Resolve the tracing directive: `RUST_LOG` wins when set, else `[tracing] level`.
+pub fn tracing_filter_directive(file_level: &str, rust_log: Option<&str>) -> String {
+    match rust_log.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(env) => env.to_string(),
+        None if file_level.trim().is_empty() => "warn".into(),
+        None => file_level.trim().to_string(),
+    }
+}
+
+fn init_tracing(file_level: &str) {
+    let directive = tracing_filter_directive(file_level, std::env::var("RUST_LOG").ok().as_deref());
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(directive))
         .with_writer(std::io::stderr)
         .try_init();
-    Ok(())
 }
 
 fn run() -> anyhow::Result<ExitCode> {
@@ -132,6 +135,7 @@ fn run() -> anyhow::Result<ExitCode> {
         None => None,
     };
     let cfg = merge(&overrides, &env, file.as_ref(), Config::default());
+    init_tracing(&cfg.tracing.level);
 
     runtime::run_wrapped(&cli.command, &cfg)
 }
@@ -166,7 +170,7 @@ fn cli_overrides(cli: &Cli) -> anyhow::Result<CliOverrides> {
         enforcement: cli
             .enforcement
             .as_deref()
-            .map(|s| s.parse::<EnforcementMode>())
+            .map(str::parse::<EnforcementMode>)
             .transpose()
             .map_err(|err| anyhow::anyhow!("{err}"))?,
         ndjson_path: cli.ndjson.clone(),
@@ -206,5 +210,17 @@ mod tests {
         let cli = Cli::parse_from(["falk", "--", "/bin/echo", "x"]);
         assert!(!cli.svarm);
         assert_eq!(cli.command, ["/bin/echo", "x"]);
+    }
+
+    #[test]
+    fn tracing_file_level_applies_when_rust_log_unset() {
+        assert_eq!(tracing_filter_directive("debug", None), "debug");
+        assert_eq!(tracing_filter_directive("debug", Some("")), "debug");
+        assert_eq!(
+            tracing_filter_directive("debug", Some("info")),
+            "info",
+            "RUST_LOG must win when set"
+        );
+        assert_eq!(tracing_filter_directive("", None), "warn");
     }
 }

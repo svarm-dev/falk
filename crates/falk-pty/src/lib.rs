@@ -239,7 +239,10 @@ pub struct ChildExit {
 
 impl ChildExit {
     pub fn from_portable(status: &portable_pty::ExitStatus) -> Self {
-        let code = status.exit_code() as i32;
+        let code = match status.signal() {
+            Some(name) => unix_signal_exit_code(name),
+            None => status.exit_code() as i32,
+        };
         Self {
             code,
             success: status.success(),
@@ -249,6 +252,42 @@ impl ChildExit {
     pub fn as_exit_code(self) -> ExitCode {
         ExitCode::from(self.code.clamp(0, 255) as u8)
     }
+}
+
+/// Map a `portable-pty` signal name onto the conventional `128 + n` exit code.
+pub fn unix_signal_exit_code(name: &str) -> i32 {
+    let n = signal_number(name).unwrap_or(1);
+    128 + n
+}
+
+fn signal_number(name: &str) -> Option<i32> {
+    let trimmed = name.trim();
+    if let Some(rest) = trimmed.strip_prefix("Signal ") {
+        return rest.parse().ok();
+    }
+    let key = trimmed
+        .strip_prefix("SIG")
+        .unwrap_or(trimmed)
+        .to_ascii_uppercase();
+    let n = match key.as_str() {
+        "HUP" | "HANGUP" => 1,
+        "INT" | "INTERRUPT" => 2,
+        "QUIT" => 3,
+        "ILL" | "ILLEGAL INSTRUCTION" => 4,
+        "TRAP" | "TRACE/BREAKPOINT TRAP" => 5,
+        "ABRT" | "ABORTED" | "IOT" => 6,
+        "BUS" | "BUS ERROR" => 7,
+        "FPE" | "FLOATING POINT EXCEPTION" => 8,
+        "KILL" | "KILLED" => 9,
+        "USR1" | "USER DEFINED SIGNAL 1" => 10,
+        "SEGV" | "SEGMENTATION FAULT" => 11,
+        "USR2" | "USER DEFINED SIGNAL 2" => 12,
+        "PIPE" | "BROKEN PIPE" => 13,
+        "ALRM" | "ALARM CLOCK" => 14,
+        "TERM" | "TERMINATED" => 15,
+        _ => return None,
+    };
+    Some(n)
 }
 
 /// Send a signal to an entire process group. Exported so tests drive the
@@ -266,7 +305,7 @@ pub fn send_killpg(pgid: i32, kind: SignalKind) -> Result<(), PtyError> {
         };
         match signal::killpg(Pid::from_raw(pgid), sig) {
             Ok(()) => Ok(()),
-            Err(err) if err == nix::errno::Errno::ESRCH => {
+            Err(nix::errno::Errno::ESRCH) => {
                 debug!(pgid, %kind, "killpg: process group already gone");
                 Ok(())
             }
@@ -386,6 +425,21 @@ mod tests {
         let status = sup.wait().expect("wait");
         assert_eq!(status.code, 42, "exit status must be preserved");
         assert!(!status.success);
+    }
+
+    #[test]
+    fn sigkill_child_reports_137() {
+        assert_eq!(unix_signal_exit_code("Killed"), 137);
+        assert_eq!(unix_signal_exit_code("SIGKILL"), 137);
+        assert_eq!(unix_signal_exit_code("SIGINT"), 130);
+        let mut sup = spawn_ok(&["/bin/sh", "-c", "kill -s KILL $$"]);
+        let _ = drain(&sup);
+        let status = sup.wait().expect("wait after self-kill");
+        assert!(!status.success);
+        assert_eq!(
+            status.code, 137,
+            "SIGKILL must be 128+9, not portable-pty's 1: {status:?}"
+        );
     }
 
     #[test]

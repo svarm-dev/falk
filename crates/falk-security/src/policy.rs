@@ -38,7 +38,11 @@ fn check_command(name: &str, args: &[String], cfg: &SecurityConfig) -> Option<St
     let base = name.rsplit('/').next().unwrap_or(name);
     let base_lc = base.to_ascii_lowercase();
 
-    if is_interpreter(&base_lc) {
+    if let Some((inner, rest)) = crate::ast::wrapped_command(&base_lc, args) {
+        return check_command(&inner, &rest, cfg);
+    }
+
+    if crate::ast::is_interpreter_name(&base_lc) {
         // Interpreters themselves are not blanket-blocked.
     } else if !cfg.allowlist.commands.is_empty() {
         let allowed = cfg
@@ -73,38 +77,41 @@ fn check_command(name: &str, args: &[String], cfg: &SecurityConfig) -> Option<St
     None
 }
 
-fn is_interpreter(base: &str) -> bool {
-    matches!(
-        base,
-        "bash"
-            | "sh"
-            | "dash"
-            | "zsh"
-            | "ksh"
-            | "ash"
-            | "busybox"
-            | "env"
-            | "python"
-            | "python3"
-            | "node"
-            | "ruby"
-            | "perl"
-            | "lua"
-    )
-}
-
 fn sensitive_path_hit(arg: &str, paths: &[String]) -> Option<String> {
-    for p in paths {
-        let expanded = expand_home(p);
-        if arg == p
-            || arg == expanded
-            || arg.starts_with(&format!("{expanded}/"))
-            || arg.starts_with(&format!("{p}/"))
-        {
-            return Some(p.clone());
+    for candidate in path_tokens(arg) {
+        for p in paths {
+            let expanded = expand_home(p);
+            if candidate == p
+                || candidate == expanded
+                || candidate.starts_with(&format!("{expanded}/"))
+                || candidate.starts_with(&format!("{p}/"))
+            {
+                return Some(p.clone());
+            }
         }
     }
     None
+}
+
+/// Tokens that might name a path: the raw arg, the suffix after `=`,
+/// and an attached short-flag path (`-o/etc/shadow`).
+fn path_tokens(arg: &str) -> Vec<&str> {
+    let mut out = vec![arg];
+    if let Some((_, rest)) = arg.split_once('=') {
+        if !rest.is_empty() {
+            out.push(rest);
+        }
+    }
+    if let Some(stripped) = arg.strip_prefix('-') {
+        if !stripped.starts_with('-') && stripped.len() >= 2 {
+            let after_flag = &stripped[1..];
+            if after_flag.starts_with('/') || after_flag.starts_with('~') || after_flag.starts_with('.')
+            {
+                out.push(after_flag);
+            }
+        }
+    }
+    out
 }
 
 fn expand_home(p: &str) -> String {
@@ -119,17 +126,11 @@ fn expand_home(p: &str) -> String {
 /// Pull a hostname out of a URL or `host:port` argument.
 pub fn extract_domain(arg: &str) -> Option<String> {
     let arg = arg.trim();
-    let rest = if let Some(r) = arg.strip_prefix("https://") {
-        r
-    } else if let Some(r) = arg.strip_prefix("http://") {
-        r
-    } else if let Some(r) = arg.strip_prefix("wss://") {
-        r
-    } else if let Some(r) = arg.strip_prefix("ws://") {
-        r
-    } else {
-        return None;
-    };
+    let rest = arg
+        .strip_prefix("https://")
+        .or_else(|| arg.strip_prefix("http://"))
+        .or_else(|| arg.strip_prefix("wss://"))
+        .or_else(|| arg.strip_prefix("ws://"))?;
     let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let host = host.rsplit('@').next().unwrap_or(host);
     let host = host.split(':').next().unwrap_or(host);
@@ -232,6 +233,53 @@ mod tests {
         assert_eq!(
             extract_domain("https://api.github.com/repos"),
             Some("api.github.com".into())
+        );
+    }
+
+    #[test]
+    fn flag_output_form_hits_sensitive_path() {
+        let mut cfg = SecurityConfig::default();
+        cfg.blocklist.sensitive_paths = vec!["/etc/shadow".into()];
+        let reason = evaluate_script("git show --output=/etc/shadow", &cfg)
+            .expect("flag-form path must be a finding");
+        assert!(reason.contains("sensitive"), "{reason}");
+        assert!(
+            evaluate_script("git show HEAD", &cfg).is_none(),
+            "plain git show is not a path hit"
+        );
+    }
+
+    #[test]
+    fn env_and_python_c_honor_rm_blocklist() {
+        let mut cfg = SecurityConfig::default();
+        cfg.blocklist.commands = vec!["rm".into()];
+        let env = evaluate_script("env rm -rf /tmp/x", &cfg).expect("env rm");
+        assert!(env.contains("blocklist"), "{env}");
+        let py = evaluate_script(r#"python -c "import os; os.system('rm -rf /tmp/x')""#, &cfg)
+            .expect("python -c rm");
+        assert!(py.contains("blocklist"), "{py}");
+        assert!(
+            evaluate_script("python3 --version", &cfg).is_none(),
+            "interpreter name itself is not blocked"
+        );
+    }
+
+    #[test]
+    fn nodejs_is_allowlist_exempt_like_node() {
+        let mut cfg = SecurityConfig::default();
+        cfg.allowlist.commands = vec!["echo".into()];
+        assert!(
+            evaluate_script("nodejs --version", &cfg).is_none(),
+            "nodejs must not be an allowlist reject"
+        );
+        assert!(
+            evaluate_script("node --version", &cfg).is_none(),
+            "node must stay exempt"
+        );
+        assert!(
+            evaluate_script("rm -rf /tmp/x", &cfg)
+                .unwrap()
+                .contains("allowlist")
         );
     }
 }

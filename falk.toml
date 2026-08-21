@@ -42,6 +42,8 @@ blocked_domains = []
 
 [security.redaction]
 enabled = true
+# Cap on how many bytes of an incomplete secret *prefix* (PEM BEGIN, sk-ant-, …)
+# may be held across chunks. Not a blanket tail clip — TUI output passes through.
 holdback_bytes = 512
 
 [finops]

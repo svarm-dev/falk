@@ -103,8 +103,9 @@ pub fn redact_text(input: &str, style: RedactStyle) -> String {
     s
 }
 
-/// Streaming redactor with a hold-back window so secrets that span buffers
-/// are still caught.
+/// Streaming redactor. Incomplete secret *prefixes* (PEM BEGIN, `sk-ant-`, …)
+/// are held across chunks; everything else is emitted immediately so a TUI
+/// is not clipped by a blanket 512-byte tail hold.
 pub struct StreamingRedactor {
     pending: Vec<u8>,
     holdback: usize,
@@ -169,11 +170,8 @@ impl StreamingRedactor {
         if open_pem_start(&self.pending).is_some() {
             self.holding_private_key = true;
         }
-        let emit_len = safe_emit_len_for_hold(
-            &self.pending,
-            self.holdback,
-            self.holding_private_key,
-        );
+        let emit_len =
+            safe_emit_len_for_hold(&self.pending, self.holdback, self.holding_private_key);
         let out = if emit_len > 0 {
             self.pending.drain(..emit_len).collect()
         } else {
@@ -203,12 +201,160 @@ pub fn safe_emit_len(pending: &[u8], holdback: usize) -> usize {
 /// the BEGIN header, so the remaining body is still held to `PEM_HOLD_CAP`.
 pub fn safe_emit_len_for_hold(pending: &[u8], holdback: usize, holding_private_key: bool) -> usize {
     let holdback = holdback.max(32);
-    let normal = pending.len().saturating_sub(holdback);
-    match open_pem_start(pending) {
+    let prefix_hold = secret_tail_hold(pending).min(holdback);
+    let normal = pending.len().saturating_sub(prefix_hold);
+    let raw = match open_pem_start(pending) {
         Some(start) if pending.len() - start > PEM_HOLD_CAP => pending.len() - PEM_HOLD_CAP,
-        Some(start) => start.min(normal),
+        Some(start) => start,
         None if holding_private_key => pending.len().saturating_sub(PEM_HOLD_CAP),
         None => normal,
+    };
+    snap_safe_cut(pending, raw)
+}
+
+/// Longest-first so `sk-ant-` wins over `sk-`.
+const TOKEN_STARTERS: &[&[u8]] = &[
+    b"-----BEGIN ",
+    b"Authorization:",
+    b"authorization:",
+    b"github_pat_",
+    b"sk-or-v1-",
+    b"sk-proj-",
+    b"sk-ant-",
+    b"sk_live_",
+    b"sk_test_",
+    b"rk_live_",
+    b"rk_test_",
+    b"Bearer ",
+    b"bearer ",
+    b"glpat-",
+    b"xoxb-",
+    b"xoxp-",
+    b"xoxa-",
+    b"xoxs-",
+    b"ghp_",
+    b"gho_",
+    b"ghu_",
+    b"ghs_",
+    b"ghr_",
+    b"npm_",
+    b"pypi-",
+    b"sk-",
+    b"eyJ",
+];
+
+fn secret_tail_hold(buf: &[u8]) -> usize {
+    if buf.is_empty() {
+        return 0;
+    }
+    let search_from = buf.len().saturating_sub(96);
+    for i in search_from..buf.len() {
+        if let Some(hold) = hold_from(buf, i) {
+            if i + hold == buf.len() {
+                return hold;
+            }
+        }
+    }
+    0
+}
+
+fn hold_from(buf: &[u8], i: usize) -> Option<usize> {
+    if !is_token_boundary(buf, i) {
+        return None;
+    }
+    let suffix = &buf[i..];
+    for starter in TOKEN_STARTERS {
+        if suffix.len() < starter.len() {
+            if starter.starts_with(suffix) {
+                return Some(suffix.len());
+            }
+            continue;
+        }
+        if suffix.starts_with(starter) {
+            let rest = &suffix[starter.len()..];
+            let body = rest.iter().take_while(|&&b| is_token_body(b)).count();
+            return Some(starter.len() + body);
+        }
+    }
+    env_assign_hold(suffix)
+}
+
+fn is_token_boundary(buf: &[u8], i: usize) -> bool {
+    if i == 0 {
+        return true;
+    }
+    let prev = buf[i - 1];
+    !prev.is_ascii_alphanumeric() && prev != b'_' && prev != b'-'
+}
+
+fn is_token_body(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'+' | b'/' | b'~' | b'=')
+}
+
+fn env_assign_hold(suffix: &[u8]) -> Option<usize> {
+    let eq = suffix.iter().rposition(|&b| b == b'=')?;
+    let key = &suffix[..eq];
+    let val = &suffix[eq + 1..];
+    if !env_key_sensitive(key) {
+        return None;
+    }
+    if val.iter().any(u8::is_ascii_whitespace) {
+        return None;
+    }
+    Some(suffix.len())
+}
+
+fn env_key_sensitive(key: &[u8]) -> bool {
+    let Ok(s) = std::str::from_utf8(key) else {
+        return false;
+    };
+    let upper = s.to_ascii_uppercase();
+    upper.ends_with("API_KEY")
+        || upper.ends_with("ACCESS_KEY")
+        || upper.ends_with("PRIVATE_KEY")
+        || upper.ends_with("SECRET_KEY_BASE")
+        || upper.ends_with("_TOKEN")
+        || upper.ends_with("_SECRET")
+        || upper.ends_with("_PASSWORD")
+        || matches!(upper.as_str(), "TOKEN" | "SECRET" | "PASSWORD" | "API_KEY")
+}
+
+/// Do not emit a cut that splits UTF-8 or an in-progress CSI/OSC sequence.
+fn snap_safe_cut(buf: &[u8], mut n: usize) -> usize {
+    if n == 0 || n >= buf.len() {
+        return n.min(buf.len());
+    }
+    while n > 0 && n < buf.len() && (buf[n] & 0b1100_0000) == 0b1000_0000 {
+        n -= 1;
+    }
+    if let Some(esc) = incomplete_escape_end(buf, n) {
+        n = esc;
+    }
+    n
+}
+
+fn incomplete_escape_end(buf: &[u8], end: usize) -> Option<usize> {
+    let prefix = buf.get(..end)?;
+    let esc = prefix.iter().rposition(|&b| b == 0x1b)?;
+    if escape_complete(&prefix[esc..]) {
+        None
+    } else {
+        Some(esc)
+    }
+}
+
+fn escape_complete(seq: &[u8]) -> bool {
+    if seq.len() < 2 {
+        return false;
+    }
+    match seq[1] {
+        b'[' => seq.iter().skip(2).any(|&b| (0x40..=0x7e).contains(&b)),
+        b']' | b'P' | b'X' | b'^' | b'_' => {
+            seq.contains(&0x07) || seq.windows(2).any(|w| w == b"\x1b\\")
+        }
+        b'(' | b')' | b'*' | b'+' => seq.len() >= 3,
+        0x40..=0x5f => true,
+        _ => seq.len() >= 2,
     }
 }
 
@@ -392,7 +538,9 @@ mod tests {
             second.len()
         );
         assert!(
-            !second.windows(window_marker.len()).any(|w| w == window_marker),
+            !second
+                .windows(window_marker.len())
+                .any(|w| w == window_marker),
             "16KiB-window marker must stay held: {}",
             String::from_utf8_lossy(&second)
         );
@@ -424,6 +572,33 @@ mod tests {
         assert!(
             !first_text.contains("BBBB"),
             "key body must not leak: {first_text:?}"
+        );
+    }
+
+    #[test]
+    fn tui_frame_is_not_clipped_by_holdback() {
+        let mut r = StreamingRedactor::standalone(512);
+        let frame = b" Accessing workspace:\n /Users/nilskanevad\n If not, take a look at this folder first.\n";
+        let visible = r.push(frame);
+        let text = String::from_utf8_lossy(&visible);
+        assert!(
+            text.contains("take a look at this folder first"),
+            "TUI tail must not sit in the hold window: {text:?}"
+        );
+        let echo = r.push(b"h");
+        assert_eq!(
+            echo, b"h",
+            "keystroke echo must be visible immediately, got {echo:?}"
+        );
+    }
+
+    #[test]
+    fn incomplete_csi_is_not_emitted_mid_sequence() {
+        let buf = b"\x1b[31 sk-ant-ABC";
+        let n = safe_emit_len(buf, 32);
+        assert_eq!(
+            n, 0,
+            "incomplete CSI before a held token prefix must stay pending, n={n}"
         );
     }
 }

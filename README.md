@@ -3,6 +3,26 @@
 Lightweight, zero-dependency, ultra-fast Rust CLI that wraps an AI coding agent
 under a real PTY and acts as a runtime sentinel + FinOps circuit breaker.
 
+## Install
+
+Linux and macOS (x86_64 and arm64):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/svarm-dev/falk/main/install.sh | bash
+```
+
+That installs a prebuilt binary to `~/.local/bin/falk`. If no matching release
+exists, the script builds from source with Cargo.
+
+Pin a version or install elsewhere:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/svarm-dev/falk/main/install.sh | bash -s -- --version v0.1.0
+curl -fsSL https://raw.githubusercontent.com/svarm-dev/falk/main/install.sh | bash -s -- --install-dir /usr/local/bin
+```
+
+Use the raw GitHub URL, not `/blob/…` — blob pages are HTML and will not run.
+
 ## Dual identity
 
 **Standalone (default).** Anyone can run falk with zero knowledge of Svärm:
@@ -55,6 +75,12 @@ See [`falk.toml`](falk.toml) for every section: `[general]`, `[pty]`,
 - [Example Svärm `agents.toml` wrappers](examples/agents.toml)
 
 ## Build
+
+```bash
+cargo install --git https://github.com/svarm-dev/falk falk-cli --locked
+```
+
+Or from a checkout:
 
 ```bash
 cargo build --release

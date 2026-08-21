@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "falk-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "falk-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rust_decimal",
  "serde",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "falk-finops"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "falk-config",
  "falk-pty",
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "falk-pty"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossterm",
  "libc",
@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "falk-security"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aho-corasick",
  "falk-config",
@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "falk-telemetry"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rust_decimal",
  "serde",

@@ -312,7 +312,7 @@ fn run_event_loop(
             match action {
                 Action::Warn { message } => {
                     warn!("{message}");
-                    eprintln!("falk: {message}");
+                    runtime_notice(&format!("falk: {message}"));
                     if let Some(em) = emitter {
                         let _ = em.emit(&Event::Warn {
                             component: "runtime".into(),
@@ -321,7 +321,7 @@ fn run_event_loop(
                     }
                 }
                 Action::Block { reason } => {
-                    eprintln!("falk: blocking: {reason}");
+                    runtime_notice(&format!("falk: blocking: {reason}"));
                     if let Some(em) = emitter {
                         let _ = em.emit(&Event::Security {
                             verdict: "block".into(),
@@ -331,7 +331,7 @@ fn run_event_loop(
                     let _ = supervisor.signal_group(SignalKind::Int);
                 }
                 Action::Kill { reason } => {
-                    eprintln!("falk: killing process tree: {reason}");
+                    runtime_notice(&format!("falk: killing process tree: {reason}"));
                     if let Some(em) = emitter {
                         let _ = em.emit(&Event::Security {
                             verdict: "kill".into(),
@@ -380,6 +380,16 @@ fn run_event_loop(
         let _ = handle.join();
     }
     Ok(())
+}
+
+/// Raw-mode PTYs do not translate LF → CR-LF, so `eprintln!` overlays the
+/// child's TUI mid-line. Always start a notice on its own row.
+fn runtime_notice(message: &str) {
+    let mut err = io::stderr();
+    let _ = err.write_all(b"\r\n");
+    let _ = err.write_all(message.as_bytes());
+    let _ = err.write_all(b"\r\n");
+    let _ = err.flush();
 }
 
 fn emit_hot(

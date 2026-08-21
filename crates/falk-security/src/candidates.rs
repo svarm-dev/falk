@@ -23,8 +23,9 @@ pub enum CandidateSource {
 pub fn extract_candidates(chunk: &str) -> Vec<Candidate> {
     let mut out = Vec::new();
     for line in chunk.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let stripped = strip_ansi(line);
+        let trimmed = stripped.trim();
+        if trimmed.is_empty() || is_tui_chrome(trimmed) {
             continue;
         }
         if let Some(from_json) = from_structured_json(trimmed) {
@@ -135,6 +136,84 @@ fn tool_script(map: &serde_json::Map<String, Value>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Drop CSI/OSC/charset sequences so a TUI redraw is not fed to bash.
+pub fn strip_ansi(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+            match bytes[i] {
+                b'[' => {
+                    i += 1;
+                    while i < bytes.len() && !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'~') {
+                        i += 1;
+                    }
+                    i = i.saturating_add(1);
+                }
+                b']' | b'P' | b'X' | b'^' | b'_' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                b'(' | b')' | b'*' | b'+' => i = (i + 2).min(bytes.len()),
+                _ => i += 1,
+            }
+            continue;
+        }
+        let width = utf8_width(bytes[i]);
+        let end = (i + width).min(bytes.len());
+        out.extend_from_slice(&bytes[i..end]);
+        i = end;
+    }
+    String::from_utf8(out)
+        .unwrap_or_else(|err| String::from_utf8_lossy(&err.into_bytes()).into_owned())
+}
+
+fn utf8_width(first: u8) -> usize {
+    match first {
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => 1,
+    }
+}
+
+fn is_tui_chrome(line: &str) -> bool {
+    let mut visible = 0usize;
+    let mut boxy = 0usize;
+    for c in line.chars() {
+        if c.is_whitespace() {
+            continue;
+        }
+        visible += 1;
+        if is_box_drawing(c) {
+            boxy += 1;
+        }
+    }
+    visible == 0 || boxy.saturating_mul(2) >= visible
+}
+
+fn is_box_drawing(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2500}'..='\u{257F}' | '\u{2580}'..='\u{259F}' | '\u{25A0}'..='\u{25FF}'
+    )
+}
+
 fn function_call_script(value: &Value) -> Option<String> {
     let call = value
         .get("function_call")
@@ -191,5 +270,22 @@ mod tests {
                 .any(|x| x.script.contains("echo hi") && x.source == CandidateSource::FunctionCall),
             "{c:?}"
         );
+    }
+
+    #[test]
+    fn box_drawing_and_ansi_are_not_pty_candidates() {
+        let rule = "─".repeat(40);
+        assert!(
+            extract_candidates(&format!("{rule}\n")).is_empty(),
+            "box-drawing rule must not be a shell candidate"
+        );
+        let ansi = "\x1b[32m\x1b[0m\n";
+        assert!(
+            extract_candidates(ansi).is_empty(),
+            "SGR-only line must not be a shell candidate"
+        );
+        let c = extract_candidates("\x1b[31mls -la\x1b[0m\n");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].script, "ls -la");
     }
 }

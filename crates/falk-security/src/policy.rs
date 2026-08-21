@@ -5,21 +5,41 @@
 
 use falk_config::SecurityConfig;
 
-use crate::ast::{WalkFinding, walk_bash};
-use crate::candidates::Candidate;
+use crate::ast::{ExtractedCommand, WalkFinding, walk_bash};
+use crate::candidates::{Candidate, CandidateSource};
 
 /// Evaluate a hybrid candidate. Returns a human-readable finding or `None`.
+///
+/// Structured `tool_use` / `function-call` payloads are known bash: parse
+/// errors fail-closed. PTY display lines are not — TUI chrome (Claude's
+/// trust prompt, markdown, box drawing) routinely produces empty `ERROR`
+/// nodes. Those lines are still scanned for extracted commands against
+/// allow/block/path/domain lists.
 pub fn evaluate_policy(candidate: &Candidate, cfg: &SecurityConfig) -> Option<String> {
-    evaluate_script(&candidate.script, cfg)
+    match candidate.source {
+        CandidateSource::PtyLine => evaluate_displayed_line(&candidate.script, cfg),
+        CandidateSource::ToolUse | CandidateSource::FunctionCall => {
+            evaluate_script(&candidate.script, cfg)
+        }
+    }
 }
 
-/// Evaluate a shell script: fail-closed walk, then allow/block/domain/path lists.
+/// Evaluate a shell script that is known to be bash (fail-closed walk, then lists).
 pub fn evaluate_script(script: &str, cfg: &SecurityConfig) -> Option<String> {
     let walk = walk_bash(script, cfg.max_ast_depth, cfg.max_ast_nodes);
     if let Some(finding) = walk.first_finding() {
         return Some(finding.reason());
     }
-    for cmd in &walk.commands {
+    check_extracted_commands(&walk.commands, cfg)
+}
+
+fn evaluate_displayed_line(script: &str, cfg: &SecurityConfig) -> Option<String> {
+    let walk = walk_bash(script, cfg.max_ast_depth, cfg.max_ast_nodes);
+    check_extracted_commands(&walk.commands, cfg)
+}
+
+fn check_extracted_commands(commands: &[ExtractedCommand], cfg: &SecurityConfig) -> Option<String> {
+    for cmd in commands {
         if let Some(reason) = check_command(&cmd.name, &cmd.args, cfg) {
             return Some(reason);
         }
@@ -105,7 +125,9 @@ fn path_tokens(arg: &str) -> Vec<&str> {
     if let Some(stripped) = arg.strip_prefix('-') {
         if !stripped.starts_with('-') && stripped.len() >= 2 {
             let after_flag = &stripped[1..];
-            if after_flag.starts_with('/') || after_flag.starts_with('~') || after_flag.starts_with('.')
+            if after_flag.starts_with('/')
+                || after_flag.starts_with('~')
+                || after_flag.starts_with('.')
             {
                 out.push(after_flag);
             }
@@ -281,5 +303,21 @@ mod tests {
                 .unwrap()
                 .contains("allowlist")
         );
+    }
+
+    #[test]
+    fn pty_line_parse_error_is_not_a_finding() {
+        let cfg = SecurityConfig::default();
+        let cand = Candidate {
+            source: CandidateSource::PtyLine,
+            script: "Do you trust this folder?".into(),
+        };
+        assert_eq!(evaluate_policy(&cand, &cfg), None);
+        let tool = Candidate {
+            source: CandidateSource::ToolUse,
+            script: "echo 'unterminated".into(),
+        };
+        let reason = evaluate_policy(&tool, &cfg).expect("known bash must fail-closed");
+        assert!(reason.contains("fail-closed"), "{reason}");
     }
 }

@@ -5,6 +5,9 @@
 //! path. The runtime fans bytes out; we evaluate asynchronously and return a
 //! [`Verdict`]. Interpreters themselves are not blanket-blocked — nested
 //! `bash -c` / `eval` arguments are re-parsed.
+//!
+//! PTY display lines are not fail-closed: TUI chrome is not bash. Structured
+//! `tool_use` / `function-call` scripts still fail-closed on parse errors.
 
 pub mod ast;
 pub mod candidates;
@@ -116,5 +119,47 @@ mod tests {
     fn default_echo_is_allowed() {
         let cfg = SecurityConfig::default();
         assert_eq!(inspect_script("echo hello", &cfg), Verdict::Allow);
+    }
+
+    #[test]
+    fn claude_trust_prompt_is_not_a_block() {
+        let cfg = SecurityConfig::default();
+        let chunk = "\
+─────────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /Users/nilskanevad
+
+ Quick safety check: This folder is writable, so I can read, edit, and execute files here.
+ Do you trust this folder? (Like your own code, a well-known open source project, or work from your team). If not, take a look at this folder first.
+   1. Yes, I trust this folder
+   2. No, exit
+ Enter to confirm · Esc to cancel
+ See the `Security guide` for details.
+";
+        let verdict = inspect_chunk(chunk, &cfg);
+        assert_eq!(verdict, Verdict::Allow, "{verdict:?}");
+    }
+
+    #[test]
+    fn pty_line_blocklist_still_fires() {
+        let mut cfg = SecurityConfig::default();
+        cfg.blocklist.commands = vec!["rm".into()];
+        let verdict = inspect_chunk("rm -rf /tmp/x\n", &cfg);
+        assert!(
+            matches!(verdict, Verdict::Block { ref reason } if reason.contains("blocklist")),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn tool_use_parse_error_still_fail_closed() {
+        let cfg = SecurityConfig::default();
+        let chunk = r#"{"type":"tool_use","name":"Bash","input":{"command":"echo 'unterminated"}}"#;
+        let verdict = inspect_chunk(chunk, &cfg);
+        assert!(
+            matches!(verdict, Verdict::Block { ref reason } if reason.contains("fail-closed")),
+            "{verdict:?}"
+        );
     }
 }

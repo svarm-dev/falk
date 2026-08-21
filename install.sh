@@ -229,22 +229,23 @@ cleanup() {
 trap cleanup EXIT
 
 install_from_release() {
-  local target archive_name url sums_url archive sums extracted
+  local target archive_name sums_name url sums_url archive sums extracted
   target="$(detect_target)"
   archive_name="${BIN_NAME}-${target}.tar.gz"
-
+  # taiki-e/upload-rust-binary-action publishes `$bin-$target.sha256`.
+  sums_name="${BIN_NAME}-${target}.sha256"
   if [ "${VERSION}" = "latest" ]; then
     url="${GITHUB_RELEASES}/latest/download/${archive_name}"
-    sums_url="${GITHUB_RELEASES}/latest/download/${archive_name}.sha256"
+    sums_url="${GITHUB_RELEASES}/latest/download/${sums_name}"
   else
     url="${GITHUB_RELEASES}/download/${VERSION}/${archive_name}"
-    sums_url="${GITHUB_RELEASES}/download/${VERSION}/${archive_name}.sha256"
+    sums_url="${GITHUB_RELEASES}/download/${VERSION}/${sums_name}"
   fi
 
   print_step "Looking for ${archive_name} (${VERSION})"
   TMPDIR_INSTALL="$(mktemp -d "${TMPDIR:-/tmp}/falk-install.XXXXXX")"
   archive="${TMPDIR_INSTALL}/${archive_name}"
-  sums="${TMPDIR_INSTALL}/${archive_name}.sha256"
+  sums="${TMPDIR_INSTALL}/${sums_name}"
 
   print_step "Downloading ${url}"
   if ! download_optional "${url}" "${archive}"; then

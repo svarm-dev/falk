@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crate::claude_jsonl::{is_claude_command, jsonl_watch_enabled, spawn_tailer};
 use anyhow::Context;
 use falk_config::{Config, Mode};
 use falk_finops::{FinopsEngine, LimitDecision, UsageEvent};
@@ -125,6 +126,7 @@ pub fn run_wrapped(argv: &[String], cfg: &Config) -> anyhow::Result<ExitCode> {
         action_tx,
         action_rx,
         emitter.as_ref(),
+        is_claude_command(argv) && jsonl_watch_enabled(),
     )?;
 
     finish_io_threads(reader_thread, Some(stdin_pump));
@@ -175,6 +177,7 @@ fn run_event_loop(
     action_tx: mpsc::Sender<Action>,
     action_rx: mpsc::Receiver<Action>,
     emitter: Option<&Arc<Emitter>>,
+    watch_claude_jsonl: bool,
 ) -> anyhow::Result<()> {
     let mut redactor = StreamingRedactor::new(
         RedactStyle::for_svarm(svarm),
@@ -265,6 +268,12 @@ fn run_event_loop(
             }
         })
         .ok();
+
+    let claude_jsonl = if watch_claude_jsonl {
+        Some(spawn_tailer(fin_tx.clone()))
+    } else {
+        None
+    };
 
     // Signal forwarding (standalone). In Svärm mode SIGWINCH will not arrive
     // from Port.open; we still install handlers so a local --svarm test works.
@@ -371,6 +380,10 @@ fn run_event_loop(
     // Disconnect subscribers so they drain remaining chunks and exit.
     // Join them here so incremental Usage.Record NDJSON is flushed before
     // falk returns the child's exit status.
+    if let Some((stop, handle)) = claude_jsonl {
+        let _ = stop.send(());
+        let _ = handle.join();
+    }
     drop(sec_tx);
     drop(fin_tx);
     if let Some(handle) = sec_handle {

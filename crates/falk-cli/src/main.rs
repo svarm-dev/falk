@@ -13,6 +13,7 @@
 //! Port-vs-PTY: Svärm `Port.open` cannot carry SIGWINCH. Resize in Svärm mode
 //! is a documented limitation, not a failure.
 
+mod claude_jsonl;
 mod runtime;
 
 use std::path::PathBuf;

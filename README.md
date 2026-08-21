@@ -23,6 +23,8 @@ curl -fsSL https://raw.githubusercontent.com/svarm-dev/falk/main/install.sh | ba
 
 Use the raw GitHub URL, not `/blob/…` — blob pages are HTML and will not run.
 
+Claude Code does not print usage JSON on the TTY. `falk --hard-limit 0.50 -- claude` tails `~/.claude/projects/<cwd>/*.jsonl` for `message.usage` instead. Set `FALK_CLAUDE_JSONL=0` to disable.
+
 ## Dual identity
 
 **Standalone (default).** Anyone can run falk with zero knowledge of Svärm:

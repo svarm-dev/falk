@@ -120,9 +120,17 @@ fn event_from_object(value: &Value) -> Option<UsageEvent> {
         return None;
     }
 
-    let provider = first_str(obj, &["provider"]).or_else(|| first_str(usage_obj, &["provider"]));
+    let mut provider =
+        first_str(obj, &["provider"]).or_else(|| first_str(usage_obj, &["provider"]));
     let model_id = first_str(obj, &["model_id", "model", "modelId"])
         .or_else(|| first_str(usage_obj, &["model_id", "model"]));
+    if provider.is_none() {
+        if let Some(m) = &model_id {
+            if m.contains("claude") {
+                provider = Some("anthropic".into());
+            }
+        }
+    }
     let estimated = obj
         .get("estimated")
         .and_then(Value::as_bool)
@@ -218,6 +226,19 @@ mod tests {
         assert_eq!(ev[0].provider.as_deref(), Some("anthropic"));
         assert!(ev[0].provider_cost_usd.is_some());
         assert!(!ev[0].estimated);
+    }
+
+    #[test]
+    fn claude_code_jsonl_assistant_usage() {
+        let line = r#"{"type":"assistant","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":5000,"cache_creation_input_tokens":200}}}"#;
+        let ev = parse_usage_events(line);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].prompt_tokens, 100);
+        assert_eq!(ev[0].completion_tokens, 20);
+        assert_eq!(ev[0].cache_read_tokens, 5000);
+        assert_eq!(ev[0].cache_write_tokens, 200);
+        assert_eq!(ev[0].provider.as_deref(), Some("anthropic"));
+        assert_eq!(ev[0].model_id.as_deref(), Some("claude-sonnet-4-20250514"));
     }
 
     #[test]

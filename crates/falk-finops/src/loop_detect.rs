@@ -76,16 +76,34 @@ impl LoopDetector {
         }
     }
 
-    /// Observe a raw stream chunk: hash it, detect failure markers, treat the
-    /// previous command fingerprint as the pairing key.
+    /// Observe a raw stream chunk. Each line is one sample so repeated
+    /// command-plus-marker lines inside a single PTY read can reach
+    /// `repeat_threshold`. A fingerprint of `0` (no `note_command`) does not trip.
     pub fn observe_chunk(&mut self, chunk: &str) -> Option<LoopTrip> {
+        let mut trip = None;
+        let mut saw_line = false;
+        for line in chunk.lines() {
+            saw_line = true;
+            if let Some(found) = self.observe_line(line) {
+                trip = Some(found);
+            }
+        }
+        if !saw_line {
+            trip = self.observe_line(chunk);
+        }
+        trip
+    }
+
+    fn observe_line(&mut self, line: &str) -> Option<LoopTrip> {
+        // PTY slaves use CRLF. Drop the CR so the same line hashes once.
+        let line = line.trim_end_matches('\r');
         let failed = self
             .failure_markers
             .iter()
-            .any(|m| chunk.to_ascii_lowercase().contains(&m.to_ascii_lowercase()));
+            .any(|m| line.to_ascii_lowercase().contains(&m.to_ascii_lowercase()));
         let sample = LoopSample {
             command_fp: self.last_command_fp,
-            output_hash: hash64(chunk.as_bytes()),
+            output_hash: hash64(line.as_bytes()),
             failed,
         };
         self.observe(sample)
@@ -128,5 +146,20 @@ mod tests {
             trip = d.observe_chunk("cat: /etc/shadow: Permission denied\n");
         }
         assert!(trip.is_some());
+    }
+
+    #[test]
+    fn repeated_lines_in_one_read_trip_when_command_noted() {
+        let mut d = LoopDetector::new(8, 4, vec!["error".into()]);
+        d.note_command("echo error");
+        let trip = d.observe_chunk("echo error\necho error\necho error\necho error\n");
+        assert!(trip.is_some(), "{trip:?}");
+    }
+
+    #[test]
+    fn repeated_failure_lines_without_command_do_not_trip() {
+        let mut d = LoopDetector::new(8, 4, vec!["error".into()]);
+        let trip = d.observe_chunk("error\nerror\nerror\nerror\n");
+        assert!(trip.is_none(), "{trip:?}");
     }
 }

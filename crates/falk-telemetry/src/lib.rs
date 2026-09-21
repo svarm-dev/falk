@@ -41,9 +41,18 @@ pub enum Event {
     },
     Limit {
         kind: LimitKind,
-        total_usd: Decimal,
+        /// USD total. Omitted for token ceilings so those numbers are not
+        /// stuffed into a dollar field.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_usd: Option<Decimal>,
         #[serde(skip_serializing_if = "Option::is_none")]
         ceiling_usd: Option<Decimal>,
+        /// Crossed token total (`max_prompt_tokens` or `max_completion_tokens`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_tokens: Option<u64>,
+        /// Configured token ceiling that was crossed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ceiling_tokens: Option<u64>,
     },
     Loop {
         reason: String,
@@ -132,8 +141,7 @@ impl Emitter {
             if !is_safe_ndjson_fd(fd) {
                 return Err(TelemetryError::Io {
                     path: format!("fd:{fd}"),
-                    message: "ndjson_fd must be a unique fd >= 3 (not stdin/stdout/stderr)"
-                        .into(),
+                    message: "ndjson_fd must be a unique fd >= 3 (not stdin/stdout/stderr)".into(),
                 });
             }
             return Ok(Some(Self::new(Sink::Fd(fd))?));
@@ -311,6 +319,66 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(body.contains("\"event\":\"warn\""));
         assert!(body.contains("hello"));
+    }
+
+    #[test]
+    fn token_limit_uses_token_fields_not_usd() {
+        let emitter = Emitter::new(Sink::Buffer).unwrap();
+        let line = emitter
+            .emit(&Event::Limit {
+                kind: LimitKind::PromptTokens,
+                total_usd: None,
+                ceiling_usd: None,
+                total_tokens: Some(120),
+                ceiling_tokens: Some(100),
+            })
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["event"], "limit");
+        assert_eq!(v["kind"], "prompt_tokens");
+        assert_eq!(v["total_tokens"], 120);
+        assert_eq!(v["ceiling_tokens"], 100);
+        assert!(v.get("total_usd").is_none(), "{line}");
+        assert!(v.get("ceiling_usd").is_none(), "{line}");
+        assert!(v.get("status").is_none());
+        assert!(v.get("wait_reason").is_none());
+        assert!(v.get("pending_question").is_none());
+        assert!(v.get("attempts").is_none());
+
+        let done = emitter
+            .emit(&Event::Limit {
+                kind: LimitKind::CompletionTokens,
+                total_usd: None,
+                ceiling_usd: None,
+                total_tokens: Some(80),
+                ceiling_tokens: Some(50),
+            })
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&done).unwrap();
+        assert_eq!(v["kind"], "completion_tokens");
+        assert_eq!(v["total_tokens"], 80);
+        assert_eq!(v["ceiling_tokens"], 50);
+        assert!(v.get("total_usd").is_none(), "{done}");
+    }
+
+    #[test]
+    fn usd_limit_keeps_decimal_strings() {
+        let emitter = Emitter::new(Sink::Buffer).unwrap();
+        let line = emitter
+            .emit(&Event::Limit {
+                kind: LimitKind::Hard,
+                total_usd: Some(dec("2.50")),
+                ceiling_usd: Some(dec("1.00")),
+                total_tokens: None,
+                ceiling_tokens: None,
+            })
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["kind"], "hard");
+        assert_eq!(v["total_usd"], "2.50");
+        assert_eq!(v["ceiling_usd"], "1.00");
+        assert!(v.get("total_tokens").is_none(), "{line}");
+        assert!(v.get("ceiling_tokens").is_none(), "{line}");
     }
 
     #[test]

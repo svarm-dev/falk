@@ -81,9 +81,18 @@ Fields intended for `Usage.Record.append/1`: `run_id`, `task_id`,
 
 ### `limit`
 
+USD crossings keep dollar fields. `kind: hard` then process-group-kills. `kind: soft` only warns.
+
 ```json
 {"event":"limit","kind":"hard","total_usd":"2.50","ceiling_usd":"2.50"}
 {"event":"limit","kind":"soft","total_usd":"1.00","ceiling_usd":"1.00"}
+```
+
+Token ceilings use the same event with their own numeric fields. Those totals are not written into `total_usd` or `ceiling_usd`. `total_tokens` is the crossed total. `ceiling_tokens` is the configured `max_prompt_tokens` or `max_completion_tokens`. A token ceiling then process-group-kills, same as `kind: hard`.
+
+```json
+{"event":"limit","kind":"prompt_tokens","total_tokens":1200,"ceiling_tokens":1000}
+{"event":"limit","kind":"completion_tokens","total_tokens":340,"ceiling_tokens":200}
 ```
 
 ### `loop`
@@ -94,7 +103,10 @@ Fields intended for `Usage.Record.append/1`: `run_id`, `task_id`,
 
 ### `security`
 
+`verdict` is `block` or `kill`, matching `[security] enforcement`. Both stop the process group (`killpg(SIGTERM)`, grace, `killpg(SIGKILL)`). `warn` leaves the child running.
+
 ```json
+{"event":"security","verdict":"block","reason":"command `rm` is on the blocklist"}
 {"event":"security","verdict":"kill","reason":"command `rm` is on the blocklist"}
 ```
 

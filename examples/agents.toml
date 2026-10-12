@@ -1,41 +1,41 @@
-# Example Svärm agents.toml wrappers.
+# Wrappers for Svärm Runner.Cli.
 #
-# Svärm's Runner.Cli invokes the configured command via Port.open (non-PTY).
-# Wrap the real agent with falk --svarm so:
-#   - the Port sees plain stdio (compatible)
-#   - the agent still gets an inner PTY
-#   - mid-run FinOps killpg is available (Svärm Budget is preflight-only)
-#   - NDJSON usage events can be mapped onto Usage.Record
-#
-# falk never writes Task status / wait_reason / pending_question / attempts.
+# `load_agents/1` reads `[agent.<name>]`. `[agents.*]` loads as an empty map.
+# Runner.Cli does not expand `${...}` and does not set `FALK_RUN_ID`.
+# `run-1` and `task-9` are literal argv. Svärm does not inject the live ids.
 
-[agents.claude]
-# Drop-in wrapper on the existing Runner.Cli Port path.
+[agent.claude]
 command = "falk"
 args = [
     "--svarm",
-    "--hard-limit", "2.50",
+    "--run-id", "run-1",
+    "--task-id", "task-9",
     "--ndjson", "falk-events.ndjson",
+    "--hard-limit", "2.50",
     "--",
     "claude",
 ]
 
-[agents.aider]
+[agent.aider]
 command = "falk"
 args = [
     "--svarm",
+    "--run-id", "run-1",
+    "--task-id", "task-9",
+    "--ndjson", "falk-events.ndjson",
     "-c", "falk.toml",
     "--",
     "aider",
     "--yes-always",
 ]
 
-[agents.codex]
+[agent.codex]
 command = "falk"
 args = [
     "--svarm",
-    "--run-id", "${SVARM_RUN_ID}",
-    "--task-id", "${SVARM_TASK_ID}",
+    "--run-id", "run-1",
+    "--task-id", "task-9",
+    "--ndjson", "falk-events.ndjson",
     "--",
     "codex",
 ]

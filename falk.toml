@@ -20,6 +20,10 @@ raw_mode = true
 
 [security]
 # fail-closed: unknown / too-complex AST nodes produce a finding.
+# warn: record the finding; the child keeps running.
+# block (default) and kill: both stop the process group with
+# killpg(SIGTERM), then kill_grace_ms, then killpg(SIGKILL).
+# The NDJSON security verdict stays "block" or "kill" to match the mode.
 enforcement = "block"
 max_ast_depth = 64
 max_ast_nodes = 4096

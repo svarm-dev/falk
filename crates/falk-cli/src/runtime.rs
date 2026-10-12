@@ -18,7 +18,7 @@ use falk_pty::signals::{SignalKind, forwarded_signal_for};
 use falk_pty::terminal::{TerminalGuard, detect_size};
 use falk_pty::{Size, Supervisor};
 use falk_security::redact::{RedactStyle, StreamingRedactor};
-use falk_security::{Verdict, inspect_chunk};
+use falk_security::{Verdict, extract_candidates, inspect_chunk};
 use falk_telemetry::{Emitter, Event, LimitKind, usage_record};
 use tracing::{debug, warn};
 
@@ -150,6 +150,15 @@ pub fn finish_io_threads(
     drop(stdin_pump);
 }
 
+/// Record every command this chunk already exposed, before it is scored.
+/// A chunk with no extracted command leaves the fingerprint at zero, and the
+/// detector will not trip.
+fn note_extracted_commands(engine: &mut FinopsEngine, chunk: &str) {
+    for cand in extract_candidates(chunk) {
+        engine.loops.note_command(&cand.script);
+    }
+}
+
 /// Map a priced FinOps usage event onto the Usage.Record NDJSON shape.
 pub fn usage_ndjson(run_id: &str, task_id: &str, event: &UsageEvent) -> Event {
     usage_record(
@@ -214,6 +223,7 @@ fn run_event_loop(
             while let Ok(chunk) = fin_rx.recv() {
                 let text = String::from_utf8_lossy(&chunk);
                 let mut engine = finops_thread.lock().expect("finops lock");
+                note_extracted_commands(&mut engine, &text);
                 let outcome = engine.ingest_chunk(&text, &finops_cfg);
                 if let Some(em) = &emit_fin {
                     for ev in &outcome.events {
@@ -229,8 +239,10 @@ fn run_event_loop(
                             if let Some(em) = &emit_fin {
                                 let _ = em.emit(&Event::Limit {
                                     kind: LimitKind::Soft,
-                                    total_usd: *total_usd,
+                                    total_usd: Some(*total_usd),
                                     ceiling_usd: Some(*limit),
+                                    total_tokens: None,
+                                    ceiling_tokens: None,
                                 });
                             }
                         }
@@ -238,8 +250,10 @@ fn run_event_loop(
                             if let Some(em) = &emit_fin {
                                 let _ = em.emit(&Event::Limit {
                                     kind: LimitKind::Hard,
-                                    total_usd: *total_usd,
+                                    total_usd: Some(*total_usd),
                                     ceiling_usd: Some(*limit),
+                                    total_tokens: None,
+                                    ceiling_tokens: None,
                                 });
                             }
                             let _ = fin_actions.send(Action::Kill {
@@ -257,10 +271,32 @@ fn run_event_loop(
                                 reason: reason.clone(),
                             });
                         }
-                        LimitDecision::PromptTokens { total, limit }
-                        | LimitDecision::CompletionTokens { total, limit } => {
+                        LimitDecision::PromptTokens { total, limit } => {
+                            if let Some(em) = &emit_fin {
+                                let _ = em.emit(&Event::Limit {
+                                    kind: LimitKind::PromptTokens,
+                                    total_usd: None,
+                                    ceiling_usd: None,
+                                    total_tokens: Some(*total),
+                                    ceiling_tokens: Some(*limit),
+                                });
+                            }
                             let _ = fin_actions.send(Action::Kill {
-                                reason: format!("token ceiling {total} >= {limit}"),
+                                reason: format!("prompt token ceiling {total} >= {limit}"),
+                            });
+                        }
+                        LimitDecision::CompletionTokens { total, limit } => {
+                            if let Some(em) = &emit_fin {
+                                let _ = em.emit(&Event::Limit {
+                                    kind: LimitKind::CompletionTokens,
+                                    total_usd: None,
+                                    ceiling_usd: None,
+                                    total_tokens: Some(*total),
+                                    ceiling_tokens: Some(*limit),
+                                });
+                            }
+                            let _ = fin_actions.send(Action::Kill {
+                                reason: format!("completion token ceiling {total} >= {limit}"),
                             });
                         }
                     }
@@ -330,14 +366,16 @@ fn run_event_loop(
                     }
                 }
                 Action::Block { reason } => {
-                    runtime_notice(&format!("falk: blocking: {reason}"));
+                    // Same process-group sequence as kill. The verdict string
+                    // stays "block" so operators can tell the modes apart.
+                    runtime_notice(&format!("falk: blocking process group: {reason}"));
                     if let Some(em) = emitter {
                         let _ = em.emit(&Event::Security {
                             verdict: "block".into(),
                             reason: reason.clone(),
                         });
                     }
-                    let _ = supervisor.signal_group(SignalKind::Int);
+                    kill_group(supervisor, grace, &mut killed);
                 }
                 Action::Kill { reason } => {
                     runtime_notice(&format!("falk: killing process tree: {reason}"));
@@ -347,10 +385,7 @@ fn run_event_loop(
                             reason: reason.clone(),
                         });
                     }
-                    if !killed {
-                        let _ = supervisor.kill_tree(grace);
-                        killed = true;
-                    }
+                    kill_group(supervisor, grace, &mut killed);
                 }
             }
         }
@@ -369,8 +404,7 @@ fn run_event_loop(
                             let _ = supervisor.signal_group(kind);
                         }
                         SignalKind::Kill => {
-                            let _ = supervisor.kill_tree(grace);
-                            killed = true;
+                            kill_group(supervisor, grace, &mut killed);
                         }
                     }
                 }
@@ -403,6 +437,14 @@ fn runtime_notice(message: &str) {
     let _ = err.write_all(message.as_bytes());
     let _ = err.write_all(b"\r\n");
     let _ = err.flush();
+}
+
+fn kill_group(supervisor: &mut Supervisor, grace: Duration, killed: &mut bool) {
+    if *killed {
+        return;
+    }
+    let _ = supervisor.kill_tree(grace);
+    *killed = true;
 }
 
 fn emit_hot(
@@ -517,6 +559,39 @@ mod tests {
         );
         assert!(matches!(kill, Some(Action::Kill { .. })), "{kill:?}");
         assert!(!matches!(block, Some(Action::Warn { .. })));
+    }
+
+    #[test]
+    fn extracted_command_trips_loop_and_bare_json_does_not() {
+        let cfg = FinopsConfig::default();
+        let mut engine = FinopsEngine::from_config(&cfg);
+        let mut trip = None;
+        let line = "echo error\n";
+        for _ in 0..cfg.loop_detect.repeat_threshold {
+            note_extracted_commands(&mut engine, line);
+            let outcome = engine.ingest_chunk(line, &cfg);
+            trip = outcome
+                .decisions
+                .into_iter()
+                .find(|d| matches!(d, LimitDecision::Loop { .. }));
+        }
+        assert!(trip.is_some(), "echo error must trip: {trip:?}");
+
+        let mut engine = FinopsEngine::from_config(&cfg);
+        let marker = "{\"note\":\"error\"}\n";
+        let mut bare = None;
+        for _ in 0..cfg.loop_detect.repeat_threshold {
+            note_extracted_commands(&mut engine, marker);
+            let outcome = engine.ingest_chunk(marker, &cfg);
+            bare = outcome
+                .decisions
+                .into_iter()
+                .find(|d| matches!(d, LimitDecision::Loop { .. }));
+        }
+        assert!(
+            bare.is_none(),
+            "JSON with no extracted command must not trip: {bare:?}"
+        );
     }
 
     #[test]

@@ -66,6 +66,8 @@ a failure.
 
 Precedence: **CLI flags > `FALK_*` env > `falk.toml` > defaults**.
 
+`[security] enforcement = "block"` (the default) and `enforcement = "kill"` both stop the child process group: `killpg(SIGTERM)`, then `[pty] kill_grace_ms`, then `killpg(SIGKILL)`. The NDJSON security verdict is `block` or `kill`, matching the mode. `enforcement = "warn"` records the finding and leaves the child running.
+
 See [`falk.toml`](falk.toml) for every section: `[general]`, `[pty]`,
 `[security]`, `[security.allowlist]`, `[security.blocklist]`,
 `[security.network]`, `[security.redaction]`, `[finops]`, `[finops.loop]`,

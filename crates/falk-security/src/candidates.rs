@@ -61,6 +61,306 @@ pub fn extract_candidates(chunk: &str) -> Vec<Candidate> {
     out
 }
 
+/// Shell invocations in `chunk`.
+///
+/// [`extract_candidates`] keeps display lines so policy can scan them. Those
+/// lines are not commands. Fingerprinting them lets four identical failure
+/// messages set `last_command_fp` and kill the process group.
+pub fn shell_invocations(chunk: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for cand in extract_candidates(chunk) {
+        if let Some(script) = invocation_script(&cand) {
+            out.push(script);
+        }
+    }
+    out
+}
+
+fn invocation_script(cand: &Candidate) -> Option<String> {
+    match cand.source {
+        CandidateSource::ToolUse | CandidateSource::FunctionCall => {
+            let script = cand.script.trim();
+            if script.is_empty() {
+                None
+            } else {
+                Some(script.to_string())
+            }
+        }
+        CandidateSource::PtyLine => shell_invocation_line(&cand.script),
+    }
+}
+
+fn shell_invocation_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    if let Some(rest) = prompt_remainder(line) {
+        if is_shell_invocation(rest) {
+            return Some(rest.to_string());
+        }
+    }
+    if is_shell_invocation(line) {
+        Some(line.to_string())
+    } else {
+        None
+    }
+}
+
+fn prompt_remainder(line: &str) -> Option<&str> {
+    let rest = if let Some(rest) = line
+        .strip_prefix("$ ")
+        .or_else(|| line.strip_prefix("# "))
+        .or_else(|| line.strip_prefix("% "))
+        .or_else(|| line.strip_prefix("\u{276f} "))
+    {
+        rest.trim_start()
+    } else {
+        let idx = line.find(' ')?;
+        let head = &line[..idx];
+        if head.len() > 1
+            && head.is_ascii()
+            && !head.contains('/')
+            && !head.contains(':')
+            && head.ends_with(['$', '#', '%'])
+        {
+            line[idx + 1..].trim_start()
+        } else {
+            return None;
+        }
+    };
+    if rest.is_empty() { None } else { Some(rest) }
+}
+
+fn is_shell_invocation(line: &str) -> bool {
+    if line.is_empty() || is_program_diagnostic(line) {
+        return false;
+    }
+    let Some(name) = command_name(line) else {
+        return false;
+    };
+    if !is_command_token(name) || is_diagnostic_word(name) || is_function_word(name) {
+        return false;
+    }
+    let syntax = has_shell_syntax(line);
+    if !syntax && contains_diagnostic_phrase(line) {
+        return false;
+    }
+    if syntax || is_path_token(name) || is_known_utility(name) {
+        return true;
+    }
+    // `my-tool` / `tool2` are commands. Plain words (`command`, `hello`) are not.
+    looks_like_program_name(name) && !contains_diagnostic_word(line)
+}
+
+fn is_program_diagnostic(line: &str) -> bool {
+    let Some(first) = line.split_whitespace().next() else {
+        return false;
+    };
+    let Some(name) = first.strip_suffix(':') else {
+        return false;
+    };
+    !name.is_empty() && !name.contains('/') && !name.contains('=')
+}
+
+fn command_name(line: &str) -> Option<&str> {
+    line.split_whitespace().find(|token| !is_assignment(token))
+}
+
+fn is_assignment(token: &str) -> bool {
+    let Some((name, value)) = token.split_once('=') else {
+        return false;
+    };
+    if name.is_empty() || value.is_empty() {
+        return false;
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_command_token(token: &str) -> bool {
+    if is_path_token(token) {
+        return !token.contains(':');
+    }
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first == '_')
+        && token.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '+' | '.' | '-')
+        })
+}
+
+fn is_path_token(token: &str) -> bool {
+    token.starts_with('/')
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with("~/")
+}
+
+fn looks_like_program_name(token: &str) -> bool {
+    token.contains(['_', '.', '-']) || token.chars().any(|c| c.is_ascii_digit())
+}
+
+fn has_shell_syntax(line: &str) -> bool {
+    if line.contains([
+        '|', ';', '&', '<', '>', '$', '`', '(', ')', '{', '}', '\'', '"', '=', '*', '?', '[', ']',
+    ]) {
+        return true;
+    }
+    line.split_whitespace()
+        .any(|token| token.starts_with('-') || token.contains('/'))
+}
+
+fn contains_diagnostic_phrase(line: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "permission denied",
+        "command not found",
+        "no such file",
+        "operation not permitted",
+        "segmentation fault",
+        "not found",
+    ];
+    let lower = line.to_ascii_lowercase();
+    PHRASES.iter().any(|phrase| lower.contains(phrase))
+}
+
+fn contains_diagnostic_word(line: &str) -> bool {
+    line.split_whitespace().any(|token| {
+        let bare = token.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        is_diagnostic_word(bare)
+    })
+}
+
+fn is_diagnostic_word(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "error"
+            | "err"
+            | "failed"
+            | "failure"
+            | "fail"
+            | "traceback"
+            | "exception"
+            | "warning"
+            | "warn"
+            | "panic"
+            | "fatal"
+            | "denied"
+            | "forbidden"
+            | "killed"
+    )
+}
+
+fn is_function_word(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "the"
+            | "a"
+            | "an"
+            | "it"
+            | "i"
+            | "we"
+            | "you"
+            | "this"
+            | "that"
+            | "and"
+            | "or"
+            | "but"
+            | "to"
+            | "of"
+            | "in"
+            | "on"
+            | "with"
+            | "is"
+            | "was"
+            | "be"
+            | "my"
+            | "our"
+            | "your"
+    )
+}
+
+fn is_known_utility(name: &str) -> bool {
+    const UTILITIES: &[&str] = &[
+        "awk",
+        "bash",
+        "bat",
+        "bun",
+        "cargo",
+        "cat",
+        "cd",
+        "chmod",
+        "chown",
+        "clang",
+        "cp",
+        "curl",
+        "dash",
+        "deno",
+        "docker",
+        "echo",
+        "env",
+        "eslint",
+        "fd",
+        "find",
+        "gcc",
+        "gh",
+        "git",
+        "go",
+        "grep",
+        "gunzip",
+        "gzip",
+        "java",
+        "javac",
+        "just",
+        "kill",
+        "kubectl",
+        "ln",
+        "ls",
+        "lua",
+        "make",
+        "mkdir",
+        "mv",
+        "mvn",
+        "node",
+        "nodejs",
+        "npm",
+        "npx",
+        "perl",
+        "pip",
+        "pip3",
+        "pnpm",
+        "podman",
+        "printf",
+        "ps",
+        "pwd",
+        "pytest",
+        "python",
+        "rg",
+        "rm",
+        "ruby",
+        "ruff",
+        "rustc",
+        "scp",
+        "sed",
+        "sh",
+        "sleep",
+        "ssh",
+        "sudo",
+        "tar",
+        "terraform",
+        "touch",
+        "uv",
+        "wget",
+        "yarn",
+        "zsh",
+    ];
+    let base = name.rsplit('/').next().unwrap_or(name);
+    UTILITIES.contains(&base)
+}
+
 fn from_structured_json(line: &str) -> Option<Vec<Candidate>> {
     let value: Value = serde_json::from_str(line).ok()?;
     let found = from_json_value(&value);
@@ -287,5 +587,68 @@ mod tests {
         let c = extract_candidates("\x1b[31mls -la\x1b[0m\n");
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].script, "ls -la");
+    }
+
+    #[test]
+    fn shell_invocations_skip_prose_and_diagnostics() {
+        assert_eq!(
+            shell_invocations("echo error\n"),
+            vec!["echo error".to_string()]
+        );
+        assert_eq!(
+            shell_invocations("$ echo error\n"),
+            vec!["echo error".to_string()]
+        );
+        assert_eq!(
+            shell_invocations("rm -rf /tmp/x\n"),
+            vec!["rm -rf /tmp/x".to_string()]
+        );
+        assert_eq!(
+            shell_invocations("git status\n"),
+            vec!["git status".to_string()]
+        );
+        assert_eq!(
+            shell_invocations("my-tool\n"),
+            vec!["my-tool".to_string()],
+            "hyphenated program names are commands"
+        );
+
+        for line in [
+            "error: permission denied",
+            "The command failed with an error",
+            "permission denied",
+            "Traceback (most recent call last):",
+            "cat: /etc/shadow: Permission denied",
+            "it failed",
+            "command failed",
+            "hello world",
+            "{\"note\":\"error\"}",
+        ] {
+            assert!(
+                shell_invocations(line).is_empty(),
+                "must not fingerprint {line:?}: {:?}",
+                shell_invocations(line)
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostics_stay_policy_candidates() {
+        let line = "error: permission denied\n";
+        assert!(
+            !extract_candidates(line).is_empty(),
+            "policy still sees the display line"
+        );
+        assert!(shell_invocations(line).is_empty());
+    }
+
+    #[test]
+    fn tool_use_script_is_a_shell_invocation() {
+        let chunk = r#"{"type":"tool_use","name":"Bash","input":{"command":"echo error"}}"#;
+        let cmds = shell_invocations(chunk);
+        assert!(
+            cmds.iter().any(|script| script.contains("echo error")),
+            "{cmds:?}"
+        );
     }
 }

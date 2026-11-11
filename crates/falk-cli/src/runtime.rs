@@ -18,7 +18,7 @@ use falk_pty::signals::{SignalKind, forwarded_signal_for};
 use falk_pty::terminal::{TerminalGuard, detect_size};
 use falk_pty::{Size, Supervisor};
 use falk_security::redact::{RedactStyle, StreamingRedactor};
-use falk_security::{Verdict, extract_candidates, inspect_chunk};
+use falk_security::{Verdict, inspect_chunk, shell_invocations};
 use falk_telemetry::{Emitter, Event, LimitKind, usage_record};
 use tracing::{debug, warn};
 
@@ -150,12 +150,12 @@ pub fn finish_io_threads(
     drop(stdin_pump);
 }
 
-/// Record every command this chunk already exposed, before it is scored.
-/// A chunk with no extracted command leaves the fingerprint at zero, and the
-/// detector will not trip.
+/// Fingerprint shell invocations in this chunk before it is scored.
+/// Prose and diagnostics do not update the fingerprint. A session that never
+/// notes a command stays at zero, and the detector will not trip.
 fn note_extracted_commands(engine: &mut FinopsEngine, chunk: &str) {
-    for cand in extract_candidates(chunk) {
-        engine.loops.note_command(&cand.script);
+    for script in shell_invocations(chunk) {
+        engine.loops.note_command(&script);
     }
 }
 
@@ -591,6 +591,50 @@ mod tests {
         assert!(
             bare.is_none(),
             "JSON with no extracted command must not trip: {bare:?}"
+        );
+    }
+
+    #[test]
+    fn prose_and_diagnostics_do_not_trip_loop() {
+        let cfg = FinopsConfig::default();
+        for line in [
+            "error: permission denied\n",
+            "The command failed with an error\n",
+            "permission denied\n",
+            "command failed\n",
+        ] {
+            let mut engine = FinopsEngine::from_config(&cfg);
+            let mut trip = None;
+            for _ in 0..cfg.loop_detect.repeat_threshold {
+                note_extracted_commands(&mut engine, line);
+                let outcome = engine.ingest_chunk(line, &cfg);
+                trip = outcome
+                    .decisions
+                    .into_iter()
+                    .find(|d| matches!(d, LimitDecision::Loop { .. }));
+            }
+            assert!(trip.is_none(), "{line:?} must not trip: {trip:?}");
+        }
+    }
+
+    #[test]
+    fn noted_command_still_trips_on_later_diagnostics() {
+        let cfg = FinopsConfig::default();
+        let mut engine = FinopsEngine::from_config(&cfg);
+        note_extracted_commands(&mut engine, "cat /etc/shadow\n");
+        let line = "cat: /etc/shadow: Permission denied\n";
+        let mut trip = None;
+        for _ in 0..cfg.loop_detect.repeat_threshold {
+            note_extracted_commands(&mut engine, line);
+            let outcome = engine.ingest_chunk(line, &cfg);
+            trip = outcome
+                .decisions
+                .into_iter()
+                .find(|d| matches!(d, LimitDecision::Loop { .. }));
+        }
+        assert!(
+            trip.is_some(),
+            "diagnostic output of a noted command must trip: {trip:?}"
         );
     }
 

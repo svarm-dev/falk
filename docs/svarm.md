@@ -97,6 +97,8 @@ Token ceilings use the same event with their own numeric fields. Those totals ar
 
 ### `loop`
 
+Fingerprints are shell invocations: `tool_use` / `function-call` scripts and shell command lines. Agent prose and program diagnostics (`error: …`, `permission denied`) do not set the fingerprint, so repeated failure text alone does not trip.
+
 ```json
 {"event":"loop","reason":"repeated command fingerprint …","repeats":4}
 ```

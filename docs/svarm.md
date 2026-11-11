@@ -69,7 +69,7 @@ One JSON object per line. Incremental `usage` events map 1:1 onto
   "prompt_tokens": 1200,
   "completion_tokens": 340,
   "cache_read_tokens": 50,
-  "provider_cost_usd": "0.042",
+  "provider_cost_usd": 0.042,
   "estimated": false,
   "source": "falk"
 }
@@ -78,6 +78,22 @@ One JSON object per line. Incremental `usage` events map 1:1 onto
 Fields intended for `Usage.Record.append/1`: `run_id`, `task_id`,
 `provider`, `model_id`, `prompt_tokens`, `completion_tokens`,
 `provider_cost_usd`, `estimated`, `source`.
+
+Drain contract, checked against svarm `Usage.normalize_attrs/1`:
+
+- `run_id`, `task_id`, and `source` are required keys. falk refuses to start
+  in Svärm mode without `--run-id` / `--task-id` (or `FALK_RUN_ID` /
+  `FALK_TASK_ID`), so every usage line is drainable. Standalone runs may
+  carry empty ids and are not drainable.
+- `source` is the literal `falk` — the mid-run worker. Map it to `worker` if
+  the ledger wants a known source enum.
+- `provider_cost_usd` is a **JSON number**. `coerce_cost/1` turns anything
+  but int/float into nil and the cost is lost. `limit` events keep decimal
+  strings; they are not ledger rows.
+- `cache_read_tokens` / `cache_write_tokens` are optional extras.
+  `normalize_attrs/1` drops unknown keys: the ledger does not store them.
+  They stay on the stream for cost transparency.
+- An omitted `provider_cost_usd` is "not reported", never a fake zero.
 
 ### `limit`
 

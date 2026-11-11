@@ -657,7 +657,7 @@ mod tests {
         assert_eq!(v["model_id"], "claude-sonnet-4");
         assert_eq!(v["prompt_tokens"], 12);
         assert_eq!(v["completion_tokens"], 34);
-        assert_eq!(v["provider_cost_usd"], "0.042");
+        assert_eq!(v["provider_cost_usd"].as_f64(), Some(0.042));
         assert_eq!(v["estimated"], false);
         assert!(v.get("status").is_none());
         assert!(v.get("wait_reason").is_none());

@@ -72,10 +72,14 @@ struct Cli {
     standalone: bool,
 
     /// Svärm run id injected into NDJSON usage events (never a Task field).
+    /// Required in `--svarm` mode (or `FALK_RUN_ID`): usage rows without an
+    /// id cannot be drained into Usage.Record.
     #[arg(long = "run-id", value_name = "ID")]
     run_id: Option<String>,
 
     /// Svärm task id injected into NDJSON usage events (never a Task field).
+    /// Required in `--svarm` mode (or `FALK_TASK_ID`): usage rows without an
+    /// id cannot be drained into Usage.Record.
     #[arg(long = "task-id", value_name = "ID")]
     task_id: Option<String>,
 
@@ -136,6 +140,7 @@ fn run() -> anyhow::Result<ExitCode> {
         None => None,
     };
     let cfg = merge(&overrides, &env, file.as_ref(), Config::default());
+    require_svarm_ids(&cfg)?;
     init_tracing(&cfg.tracing.level);
 
     runtime::run_wrapped(&cli.command, &cfg)
@@ -185,6 +190,21 @@ fn cli_overrides(cli: &Cli) -> anyhow::Result<CliOverrides> {
     })
 }
 
+/// `Usage.normalize_attrs/1` fetch!-es `:run_id` and `:task_id`, so a Svärm
+/// run without them would produce rows the ledger rejects or orphans. Refuse
+/// to start instead. Standalone runs are free of this contract.
+pub fn require_svarm_ids(cfg: &Config) -> anyhow::Result<()> {
+    if cfg.effective_mode() == Mode::Svarm
+        && (cfg.svarm.run_id.trim().is_empty() || cfg.svarm.task_id.trim().is_empty())
+    {
+        anyhow::bail!(
+            "Svärm mode requires --run-id and --task-id (or FALK_RUN_ID / FALK_TASK_ID); \
+             usage rows without ids cannot be drained into Usage.Record"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +243,28 @@ mod tests {
             "RUST_LOG must win when set"
         );
         assert_eq!(tracing_filter_directive("", None), "warn");
+    }
+
+    #[test]
+    fn svarm_mode_requires_run_and_task_ids() {
+        let mut cfg = Config::default();
+        cfg.svarm.enabled = true;
+        cfg.svarm.run_id = "run-1".into();
+        cfg.svarm.task_id = "task-9".into();
+        assert!(require_svarm_ids(&cfg).is_ok());
+
+        cfg.svarm.run_id = String::new();
+        assert!(require_svarm_ids(&cfg).is_err(), "empty run_id");
+        cfg.svarm.run_id = "   ".into();
+        assert!(require_svarm_ids(&cfg).is_err(), "blank run_id");
+        cfg.svarm.run_id = "run-1".into();
+        cfg.svarm.task_id = String::new();
+        assert!(require_svarm_ids(&cfg).is_err(), "empty task_id");
+    }
+
+    #[test]
+    fn standalone_does_not_require_ids() {
+        let cfg = Config::default();
+        assert!(require_svarm_ids(&cfg).is_ok());
     }
 }

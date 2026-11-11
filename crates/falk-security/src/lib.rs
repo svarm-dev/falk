@@ -15,7 +15,7 @@ pub mod policy;
 pub mod redact;
 
 pub use ast::{WalkFinding, WalkOutcome, walk_bash};
-pub use candidates::{Candidate, extract_candidates};
+pub use candidates::{Candidate, extract_candidates, shell_invocations};
 pub use policy::{evaluate_policy, evaluate_script};
 pub use redact::{RedactStyle, StreamingRedactor, redact_text};
 

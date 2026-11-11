@@ -260,6 +260,8 @@ const LOOP_HITS: &str = r#"trap '' INT TERM; i=0; while [ "$i" -lt 8 ]; do print
 
 const LOOP_MISS: &str = r#"trap '' INT TERM; i=0; while [ "$i" -lt 8 ]; do printf '%s\n' '{"note":"error"}'; sleep 0.15; i=$((i+1)); done; while true; do sleep 30; done"#;
 
+const LOOP_PROSE: &str = r#"trap '' INT TERM; i=0; while [ "$i" -lt 8 ]; do printf '%s\n' 'error: permission denied' 'The command failed with an error'; sleep 0.15; i=$((i+1)); done; while true; do sleep 30; done"#;
+
 fn loop_toml() -> String {
     r#"
 [pty]
@@ -277,7 +279,7 @@ fn usage_script(json: &str) -> String {
     format!("trap '' INT TERM; printf '%s\\n' '{json}'; while true; do sleep 30; done")
 }
 
-fn limit_line<'a>(body: &'a str, kind: &str) -> serde_json::Value {
+fn limit_line(body: &str, kind: &str) -> serde_json::Value {
     body.lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .find(|value| {
@@ -387,8 +389,39 @@ fn loop_breaker_ignores_failure_marker_without_command() {
 }
 
 #[test]
+fn loop_breaker_ignores_repeated_error_text() {
+    let mut wrap = Wrap::spawn(&loop_toml(), LOOP_PROSE);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let stdout = loop {
+        let got = wrap.output();
+        if (got.matches("permission denied").count() >= 4
+            && got.matches("failed with an error").count() >= 4)
+            || Instant::now() >= deadline
+        {
+            break got;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        stdout.matches("permission denied").count() >= 4
+            && stdout.matches("failed with an error").count() >= 4,
+        "error text was not repeated\nstdout={stdout:?}\nstderr={}",
+        wrap.err()
+    );
+    thread::sleep(Duration::from_millis(1200));
+    wrap.assert_alive();
+    let body = wrap.ndjson();
+    println!("prose still running\n{body}");
+    assert!(
+        !body.lines().any(|line| line.contains("\"event\":\"loop\"")),
+        "loop event on prose or a diagnostic:\n{body}"
+    );
+    assert_no_task_fields(&body);
+}
+
+#[test]
 fn prompt_token_ceiling_emits_limit_and_kills() {
-    let toml = r#"
+    let toml = r"
 [pty]
 kill_grace_ms = 200
 
@@ -396,14 +429,14 @@ kill_grace_ms = 200
 max_prompt_tokens = 100
 max_completion_tokens = 0
 estimator = false
-"#;
+";
     let json = r#"{"provider":"anthropic","model_id":"claude-sonnet-4","usage":{"input_tokens":120,"output_tokens":1},"provider_cost_usd":"0.001"}"#;
     assert_token_kill(toml, json, "prompt_tokens", 120, 100);
 }
 
 #[test]
 fn completion_token_ceiling_emits_limit_and_kills() {
-    let toml = r#"
+    let toml = r"
 [pty]
 kill_grace_ms = 200
 
@@ -411,7 +444,7 @@ kill_grace_ms = 200
 max_prompt_tokens = 0
 max_completion_tokens = 50
 estimator = false
-"#;
+";
     let json = r#"{"provider":"anthropic","model_id":"claude-sonnet-4","usage":{"input_tokens":1,"output_tokens":80},"provider_cost_usd":"0.001"}"#;
     assert_token_kill(toml, json, "completion_tokens", 80, 50);
 }

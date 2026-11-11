@@ -4,9 +4,10 @@
 //! never write Task fields `status`, `wait_reason`, `pending_question`, or
 //! `attempts` — those belong exclusively to the Svärm Orchestrator.
 //!
-//! Incremental `usage` events map 1:1 onto `Svarm.Usage` / `Usage.Record`:
-//! `run_id`, `task_id`, `provider`, `model_id`, token fields,
-//! `provider_cost_usd`, `estimated`.
+//! Incremental `usage` events are shaped for `Svarm.Usage` / `Usage.Record`:
+//! required `run_id`, `task_id`, `source`, token fields, and a numeric
+//! `provider_cost_usd` (`coerce_cost/1` drops anything but int/float).
+//! See `docs/svarm.md` for the full drain contract.
 
 use std::fs::File;
 use std::io::Write;
@@ -15,6 +16,34 @@ use std::sync::Mutex;
 
 use rust_decimal::Decimal;
 use serde::Serialize;
+
+/// `Usage.Record.provider_cost_usd` is a float and svarm's `coerce_cost/1`
+/// drops anything but int/float, so the usage line carries a JSON number —
+/// a decimal string would be silently discarded. `limit` events keep decimal
+/// strings; they are not ledger rows.
+mod cost_as_f64 {
+    use rust_decimal::Decimal;
+    use rust_decimal::prelude::ToPrimitive;
+    use serde::Serializer;
+
+    // serde `with` on an `Option<Decimal>` field calls serialize with
+    // `&Option<Decimal>`; `Option<&T>` is not callable there.
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S: Serializer>(
+        value: &Option<Decimal>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(dec) => match dec.to_f64() {
+                Some(f) => serializer.serialize_f64(f),
+                None => Err(serde::ser::Error::custom(format!(
+                    "provider_cost_usd {dec} does not fit f64"
+                ))),
+            },
+            None => serializer.serialize_none(),
+        }
+    }
+}
 
 /// A single NDJSON record. Field names for `usage` match Usage.Record.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -33,7 +62,9 @@ pub enum Event {
         cache_read_tokens: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_write_tokens: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        /// JSON number on the wire. A string would be dropped by
+        /// `Usage.coerce_cost/1`, losing the cost. Omitted when unknown.
+        #[serde(skip_serializing_if = "Option::is_none", with = "cost_as_f64")]
         provider_cost_usd: Option<Decimal>,
         estimated: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -295,13 +326,82 @@ mod tests {
         assert_eq!(v["model_id"], "claude-sonnet-4");
         assert_eq!(v["prompt_tokens"], 12);
         assert_eq!(v["completion_tokens"], 34);
-        assert_eq!(v["provider_cost_usd"], "0.042");
+        // Number, not string: Usage.coerce_cost/1 drops non-numeric values.
+        assert!(v["provider_cost_usd"].is_number());
+        assert_eq!(v["provider_cost_usd"].as_f64(), Some(0.042));
         assert_eq!(v["estimated"], false);
         // Dual-identity: we must never emit orchestrator-owned Task fields.
         assert!(v.get("status").is_none());
         assert!(v.get("wait_reason").is_none());
         assert!(v.get("pending_question").is_none());
         assert!(v.get("attempts").is_none());
+    }
+
+    /// Golden line for the Svärm drain. `Usage.normalize_attrs/1` fetch!-es
+    /// `:run_id`, `:task_id`, `:source` and coerces `provider_cost_usd` from a
+    /// number only. Any shape change here must be deliberate.
+    #[test]
+    fn usage_line_matches_usage_record_contract() {
+        let emitter = Emitter::new(Sink::Buffer).unwrap();
+        let event = usage_record(
+            "run-1",
+            "task-9",
+            Some("anthropic".into()),
+            Some("claude-sonnet-4".into()),
+            12,
+            34,
+            5,
+            6,
+            Some(dec("0.042")),
+            false,
+        );
+        let line = emitter.emit(&event).unwrap();
+        assert_eq!(
+            line,
+            r#"{"event":"usage","run_id":"run-1","task_id":"task-9","provider":"anthropic","model_id":"claude-sonnet-4","prompt_tokens":12,"completion_tokens":34,"cache_read_tokens":5,"cache_write_tokens":6,"provider_cost_usd":0.042,"estimated":false,"source":"falk"}"#
+        );
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        // serde_json::Map is a BTreeMap: sorted, not wire order.
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "completion_tokens",
+                "estimated",
+                "event",
+                "model_id",
+                "prompt_tokens",
+                "provider",
+                "provider_cost_usd",
+                "run_id",
+                "source",
+                "task_id",
+            ],
+            "usage line keys are the documented contract, not an accident"
+        );
+    }
+
+    /// Minimal line still satisfies `normalize_attrs/1`: its required keys are
+    /// always present. `provider_cost_usd` is omitted, not null — svarm reads
+    /// a missing cost as "not reported", not a fake zero.
+    #[test]
+    fn minimal_usage_line_has_normalize_attrs_required_keys() {
+        let emitter = Emitter::new(Sink::Buffer).unwrap();
+        let event = usage_event("run-1", "task-9", None, None, 12, 34, None, false);
+        let line = emitter.emit(&event).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        for key in ["run_id", "task_id", "source"] {
+            assert!(
+                v.get(key).is_some(),
+                "{key} is required by Usage.normalize_attrs/1: {line}"
+            );
+        }
+        assert_eq!(v["source"], "falk");
+        assert!(v.get("provider_cost_usd").is_none(), "{line}");
+        assert!(v.get("cache_read_tokens").is_none(), "{line}");
+        assert!(v.get("cache_write_tokens").is_none(), "{line}");
     }
 
     #[test]
